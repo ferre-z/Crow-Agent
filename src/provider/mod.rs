@@ -16,6 +16,7 @@
 //! [`ProviderError::Cancelled`] if the token is already triggered, and
 //! terminating the stream promptly if it fires mid-flight.
 
+pub mod genai;
 pub mod mock;
 pub mod stream;
 
