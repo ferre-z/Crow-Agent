@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tokio_stream::StreamExt;
@@ -12,7 +13,7 @@ use crate::message::{Message, Part, Role};
 use crate::provider::{ModelRequest, Provider, ProviderError};
 use crate::session::SessionWriter;
 use crate::session_entry::SessionEntry;
-use crate::tool::ToolRegistry;
+use crate::tool::{execute_tool_call, ToolCall, ToolContext, ToolOutcome, ToolRegistry};
 
 /// Limits and durable resources used by an [`Agent`].
 #[derive(Debug)]
@@ -108,10 +109,22 @@ impl Agent {
         .await?;
         self.history.push(user_msg);
 
+        let mut total_tool_calls = 0_u32;
         for turn in 1..=self.config.max_turns {
             self.ensure_not_cancelled().await?;
             self.state = AgentState::Sampling { turn };
-            if serialized_len(&self.history) > 128_000 {
+            let compiled = crate::context::compile(
+                &self.config.project_root,
+                &self.config.project_root,
+            )
+            .map_err(|error| AgentError::Provider(error.to_string()))?;
+            let context_len = compiled.system_prompt.len()
+                + compiled
+                    .instructions
+                    .iter()
+                    .map(|instruction| instruction.content.len())
+                    .sum::<usize>();
+            if serialized_len(&self.history).saturating_add(context_len) > 128_000 {
                 self.state = AgentState::Failed;
                 return Err(AgentError::ContextLimit);
             }
@@ -177,9 +190,101 @@ impl Agent {
             .await?;
             self.history.push(assistant);
 
-            if matches!(stop_reason, StopReason::ToolUse) {
-                self.state = AgentState::Failed;
-                return Err(AgentError::Tool("tool calls are not implemented".into()));
+            let tool_calls: Vec<ToolCall> = self
+                .history
+                .last()
+                .into_iter()
+                .flat_map(|message| message.parts.iter())
+                .filter_map(|part| match part {
+                    Part::ToolCall { id, name, args } => Some(ToolCall {
+                        call_id: *id,
+                        name: name.clone(),
+                        args: args.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            if !tool_calls.is_empty() {
+                total_tool_calls = total_tool_calls.saturating_add(tool_calls.len() as u32);
+                if total_tool_calls > self.config.max_tool_calls {
+                    self.state = AgentState::Failed;
+                    return Err(AgentError::MaxToolCallsExceeded(
+                        self.config.max_tool_calls,
+                    ));
+                }
+                for call in tool_calls {
+                    self.ensure_not_cancelled().await?;
+                    self.state = AgentState::ExecutingTool {
+                        turn,
+                        call_id: call.call_id,
+                    };
+                    self.append(SessionEntry::ToolStarted {
+                        call_id: call.call_id,
+                        name: call.name.clone(),
+                        args: call.args.clone(),
+                        timestamp: Timestamp::now(),
+                    })
+                    .await?;
+                    let (event_sink, _events) = tokio::sync::mpsc::channel(256);
+                    let outcome = execute_tool_call(
+                        &self.tools,
+                        &call,
+                        ToolContext {
+                            project_root: self.config.project_root.clone(),
+                            max_output_bytes: 1_048_576,
+                            command_timeout: Duration::from_secs(30),
+                        },
+                        event_sink,
+                        self.cancel.clone(),
+                    )
+                    .await;
+                    if self.cancel.is_cancelled() {
+                        return self.interrupt(Some(call.call_id)).await;
+                    }
+                    let (event_outcome, output, is_error, truncated) = match outcome {
+                        ToolOutcome::Success { output, truncated } => (
+                            crate::event::ToolOutcome::Success {
+                                output: output.clone(),
+                                truncated,
+                            },
+                            output,
+                            false,
+                            truncated,
+                        ),
+                        ToolOutcome::Error {
+                            code,
+                            message,
+                            truncated,
+                        } => (
+                            crate::event::ToolOutcome::Error {
+                                code,
+                                message: message.clone(),
+                                truncated,
+                            },
+                            message,
+                            true,
+                            truncated,
+                        ),
+                    };
+                    self.append(SessionEntry::ToolFinished {
+                        call_id: call.call_id,
+                        outcome: event_outcome,
+                        timestamp: Timestamp::now(),
+                    })
+                    .await?;
+                    self.history.push(Message {
+                        id: crate::ids::MessageId(new_id()),
+                        role: Role::ToolResult,
+                        parts: vec![Part::ToolResult {
+                            call_id: call.call_id,
+                            output,
+                            is_error,
+                            truncated,
+                            display: None,
+                        }],
+                    });
+                }
+                continue;
             }
             self.state = AgentState::Completing;
             self.append(SessionEntry::RunFinished {
@@ -275,10 +380,46 @@ fn map_provider_error(error: ProviderError) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use crate::event::{StopReason, Usage};
     use crate::ids::{new_id, MessageId};
     use crate::message::{Part, Role};
     use crate::provider::mock::ScriptedProvider;
+    use crate::provider::ProviderStream;
+    use crate::tool::read::ReadTool;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct TurnProvider {
+        turns: Mutex<VecDeque<Vec<AgentEvent>>>,
+        request_lengths: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl Provider for TurnProvider {
+        async fn stream(
+            &self,
+            req: ModelRequest,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            if cancel.is_cancelled() {
+                return Err(ProviderError::Cancelled);
+            }
+            self.request_lengths
+                .lock()
+                .map_err(|_| ProviderError::StreamInvalid("length lock poisoned".into()))?
+                .push(req.messages.len());
+            let events = self
+                .turns
+                .lock()
+                .map_err(|_| ProviderError::StreamInvalid("turn lock poisoned".into()))?
+                .pop_front()
+                .unwrap_or_default();
+            Ok(ProviderStream {
+                events: Box::pin(tokio_stream::iter(events.into_iter().map(Ok))),
+            })
+        }
+    }
 
     fn user(text: &str) -> Message {
         Message {
@@ -375,5 +516,254 @@ mod tests {
         let error = agent.submit(user("hello")).await.expect_err("max turns");
 
         assert!(matches!(error, AgentError::MaxTurnsExceeded(1)));
+    }
+
+    async fn tool_agent(
+        root: &std::path::Path,
+        turns: Vec<Vec<AgentEvent>>,
+    ) -> Agent {
+        let writer = SessionWriter::open(root.join("session.jsonl"))
+            .await
+            .expect("open session");
+        let mut tools = ToolRegistry::new();
+        tools.register(ReadTool);
+        Agent::new(
+            AgentConfig {
+                max_turns: 2,
+                max_tool_calls: 2,
+                model: "test".into(),
+                project_root: root.to_path_buf(),
+                session_writer: writer,
+            },
+            Arc::new(TurnProvider {
+                turns: Mutex::new(turns.into()),
+                request_lengths: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(tools),
+            CancellationToken::new(),
+            Vec::new(),
+        )
+    }
+
+    fn tool_turn(path: &str) -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::ToolStarted {
+                call_id: ToolCallId(new_id()),
+                name: "read".into(),
+                args: serde_json::json!({"path": path}),
+            },
+            AgentEvent::ModelFinished {
+                usage: Usage { input_tokens: 1, output_tokens: 1 },
+                stop_reason: StopReason::ToolUse,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn agent_calls_read_tool_then_responds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("hello.txt"), "hello\n").expect("write file");
+        let mut agent = tool_agent(
+            dir.path(),
+            vec![tool_turn("hello.txt"), text_events("Done")],
+        )
+        .await;
+
+        let result = agent.submit(user("read it")).await.expect("submit");
+
+        assert_eq!(result, AgentEvent::RunFinished { message: "Done".into() });
+        assert!(agent.history.iter().any(|message| message.role == Role::ToolResult));
+    }
+
+    #[tokio::test]
+    async fn agent_handles_tool_error_gracefully() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = tool_agent(
+            dir.path(),
+            vec![tool_turn("missing.txt"), text_events("Recovered")],
+        )
+        .await;
+
+        let result = agent.submit(user("read it")).await.expect("submit");
+
+        assert_eq!(
+            result,
+            AgentEvent::RunFinished {
+                message: "Recovered".into()
+            }
+        );
+        assert!(agent.history.iter().any(|message| {
+            matches!(message.parts.first(), Some(Part::ToolResult { is_error: true, .. }))
+        }));
+    }
+
+    #[tokio::test]
+    async fn agent_enforces_max_tool_calls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = tool_agent(dir.path(), vec![tool_turn("one.txt")]).await;
+        agent.config.max_tool_calls = 0;
+
+        let error = agent.submit(user("read")).await.expect_err("tool limit");
+
+        assert!(matches!(error, AgentError::MaxToolCallsExceeded(0)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_writes_run_interrupted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session.jsonl");
+        let mut agent = tool_agent(dir.path(), vec![text_events("unused")]).await;
+        agent.cancel();
+
+        let error = agent.submit(user("stop")).await.expect_err("cancelled");
+        let entries = crate::session::read_entries(path).await.expect("read");
+
+        assert!(matches!(error, AgentError::Cancelled));
+        assert!(matches!(entries.last(), Some(SessionEntry::RunInterrupted { .. })));
+    }
+
+    struct ErrorProvider;
+
+    #[async_trait]
+    impl Provider for ErrorProvider {
+        async fn stream(
+            &self,
+            _req: ModelRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            Err(ProviderError::Upstream {
+                code: "offline".into(),
+                message: "unavailable".into(),
+                retryable: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_is_typed_and_not_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SessionWriter::open(dir.path().join("session.jsonl"))
+            .await
+            .expect("open");
+        let mut agent = Agent::new(
+            AgentConfig {
+                max_turns: 3,
+                max_tool_calls: 1,
+                model: "test".into(),
+                project_root: dir.path().to_path_buf(),
+                session_writer: writer,
+            },
+            Arc::new(ErrorProvider),
+            Arc::new(ToolRegistry::new()),
+            CancellationToken::new(),
+            Vec::new(),
+        );
+
+        let error = agent.submit(user("hello")).await.expect_err("provider");
+
+        assert!(matches!(error, AgentError::Provider(message) if message.contains("offline")));
+    }
+
+    #[tokio::test]
+    async fn oversized_history_returns_context_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SessionWriter::open(dir.path().join("session.jsonl"))
+            .await
+            .expect("open");
+        let mut agent = Agent::new(
+            AgentConfig {
+                max_turns: 1,
+                max_tool_calls: 1,
+                model: "test".into(),
+                project_root: dir.path().to_path_buf(),
+                session_writer: writer,
+            },
+            Arc::new(ScriptedProvider::from_events(text_events("unused"))),
+            Arc::new(ToolRegistry::new()),
+            CancellationToken::new(),
+            vec![user(&"x".repeat(128_000))],
+        );
+
+        let error = agent.submit(user("hello")).await.expect_err("context");
+
+        assert!(matches!(error, AgentError::ContextLimit));
+    }
+
+    #[tokio::test]
+    async fn three_tool_calls_execute_sequentially() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "a").expect("write");
+        let mut calls = Vec::new();
+        for _ in 0..3 {
+            calls.push(AgentEvent::ToolStarted {
+                call_id: ToolCallId(new_id()),
+                name: "read".into(),
+                args: serde_json::json!({"path": "a.txt"}),
+            });
+        }
+        calls.push(AgentEvent::ModelFinished {
+            usage: Usage { input_tokens: 1, output_tokens: 1 },
+            stop_reason: StopReason::ToolUse,
+        });
+        let mut agent = tool_agent(dir.path(), vec![calls, text_events("Done")]).await;
+        agent.config.max_tool_calls = 3;
+
+        agent.submit(user("read thrice")).await.expect("submit");
+
+        assert_eq!(
+            agent
+                .history
+                .iter()
+                .filter(|message| message.role == Role::ToolResult)
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn history_grows_monotonically_between_turns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "a").expect("write");
+        let lengths = Arc::new(Mutex::new(Vec::new()));
+        let writer = SessionWriter::open(dir.path().join("session.jsonl"))
+            .await
+            .expect("open");
+        let mut tools = ToolRegistry::new();
+        tools.register(ReadTool);
+        let mut agent = Agent::new(
+            AgentConfig {
+                max_turns: 2,
+                max_tool_calls: 1,
+                model: "test".into(),
+                project_root: dir.path().to_path_buf(),
+                session_writer: writer,
+            },
+            Arc::new(TurnProvider {
+                turns: Mutex::new(vec![tool_turn("a.txt"), text_events("Done")].into()),
+                request_lengths: lengths.clone(),
+            }),
+            Arc::new(tools),
+            CancellationToken::new(),
+            Vec::new(),
+        );
+
+        agent.submit(user("read")).await.expect("submit");
+
+        assert_eq!(*lengths.lock().expect("lengths"), vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn consecutive_submits_append_to_existing_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = tool_agent(
+            dir.path(),
+            vec![text_events("First"), text_events("Second")],
+        )
+        .await;
+
+        agent.submit(user("one")).await.expect("first");
+        agent.submit(user("two")).await.expect("second");
+
+        assert_eq!(agent.history.len(), 4);
     }
 }
