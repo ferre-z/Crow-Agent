@@ -1,21 +1,24 @@
 ### Task 2.9 — Nemotron API research (Nemotron Ultra subagent)
 
-`docs/decisions/02-nemotron-genai-api.md`:
-- Verify the NVIDIA endpoint URL (hosted vs self-hosted NIM)
-- Confirm the exact model identifier for Nemotron 3 Ultra
-- Document the tool-call streaming format (does the API return tool calls in deltas or as a single block?)
-- Document the reasoning field (does `genai` 0.6.5 surface it for Nemotron?)
-- Document the rate-limit response shape
-- Document any `genai` quirks specific to this provider
+**Files:**
+- Create: `docs/decisions/05-nemotron-genai-api.md`
 
-**Acceptance:** the doc cites 2+ official sources (NVIDIA docs, model card, or `genai` source) per claim.
+**Why this exists:** task 2.2 (genai adapter) needs to know the exact Nemotron endpoint URL, model identifier, and how `genai 0.6.5` surfaces the streaming events for it. This research produces a single document that the implementer can reference without leaving their worktree.
 
-## Review gate (same as wave 1)
+**Acceptance:**
+- The doc cites 2+ official sources per claim (NVIDIA docs, model card, or `genai` source).
+- Covers:
+  1. **Endpoint URL.** Hosted (`integrate.api.nvidia.com/v1`) vs self-hosted NIM. What URL does task 2.2 use as the default?
+  2. **Model identifier.** The exact string for Nemotron 3 Ultra on the hosted endpoint.
+  3. **Tool-call streaming format.** Does the API return tool calls as deltas (multiple events) or as a single block? Cite the genai source.
+  4. **Reasoning field.** Does `genai 0.6.5` surface a reasoning field for Nemotron? What's the field name?
+  5. **Rate-limit response shape.** What HTTP status + body shape does Nemotron return on 429?
+  6. **`genai` quirks.** Any Nemotron-specific behaviour in `genai::Client::exec_chat_stream` (e.g. required headers, special model flags, model-specific reasoning parsers)?
+- Use **Nemotron Ultra** model (this is a research task, not an implementer task — it's cheap to be thorough).
+- Save the document under `docs/decisions/05-nemotron-genai-api.md` with frontmatter matching Decision 01-04.
 
-Two MiniMax M3 reviewers per task: spec compliance + code quality.
-Reject if the implementer doesn't paste `cargo test` output.
+**Output:**
+- A markdown document with one section per topic, each citing at least 2 sources inline.
+- A short "Implications for task 2.2" section at the end summarising what the implementer needs to know.
 
-## Decision log to update
-
-- `docs/decisions/02-nemotron-genai-api.md` (from 2.9)
-- `docs/decisions/03-context-size-estimation.md` (added in 2.6 if needed) — how we estimate context size for the `context_limit` error before real compaction ships
+**Routes:** dispatched via `claude -p` with model `nemotron` (or whatever the routing model is — see SOUL.md). Subagent has no code to write, only docs to read and synthesize.
