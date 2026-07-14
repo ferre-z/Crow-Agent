@@ -17,6 +17,7 @@
 //! terminating the stream promptly if it fires mid-flight.
 
 pub mod mock;
+pub mod stream;
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -25,6 +26,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::event::AgentEvent;
 use crate::message::Message;
+
+// Re-exports from the stream-accumulator submodule so callers can
+// write `crate::provider::StreamAccumulator`,
+// `crate::provider::ProviderChunk`, and `crate::provider::StreamError`
+// without reaching into a sub-module.
+pub use self::stream::{ProviderChunk, StreamAccumulator, StreamError};
 
 /// What the loop sends to a model provider for one invocation.
 ///

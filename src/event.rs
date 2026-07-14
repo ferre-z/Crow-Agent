@@ -94,7 +94,7 @@ pub enum ToolOutcome {
 }
 
 /// Token accounting for a single model invocation.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
 pub struct Usage {
     /// Tokens consumed by the prompt (input side).
     pub input_tokens: u32,
