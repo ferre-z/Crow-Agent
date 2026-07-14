@@ -15,7 +15,9 @@ name = "crow"
 path = "src/main.rs"
 
 [lints.clippy]
-pedantic = { level = "warn", priority = -1 }
+# pedantic is OFF for v0 — our spec is exact, our types are simple,
+# and pedantic warnings create churn for no real benefit. Re-evaluate
+# at the v1 boundary.
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "process", "io-util"] }
