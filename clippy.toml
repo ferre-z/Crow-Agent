@@ -1,0 +1,2 @@
+# Project lint policy lives in Cargo.toml [lints.clippy].
+# This file is intentionally minimal.
