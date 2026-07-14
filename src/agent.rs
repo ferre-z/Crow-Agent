@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_util::sync::CancellationToken;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::event::{AgentEvent, StopReason, Usage, SCHEMA_VERSION};
 use crate::ids::{new_id, SessionId, Timestamp, ToolCallId};
@@ -113,11 +113,9 @@ impl Agent {
         for turn in 1..=self.config.max_turns {
             self.ensure_not_cancelled().await?;
             self.state = AgentState::Sampling { turn };
-            let compiled = crate::context::compile(
-                &self.config.project_root,
-                &self.config.project_root,
-            )
-            .map_err(|error| AgentError::Provider(error.to_string()))?;
+            let compiled =
+                crate::context::compile(&self.config.project_root, &self.config.project_root)
+                    .map_err(|error| AgentError::Provider(error.to_string()))?;
             let context_len = compiled.system_prompt.len()
                 + compiled
                     .instructions
@@ -151,8 +149,16 @@ impl Agent {
                     Some(Ok(AgentEvent::ReasoningDelta { text })) => {
                         parts.push(Part::Reasoning { text });
                     }
-                    Some(Ok(AgentEvent::ToolStarted { call_id, name, args })) => {
-                        parts.push(Part::ToolCall { id: call_id, name, args });
+                    Some(Ok(AgentEvent::ToolStarted {
+                        call_id,
+                        name,
+                        args,
+                    })) => {
+                        parts.push(Part::ToolCall {
+                            id: call_id,
+                            name,
+                            args,
+                        });
                     }
                     Some(Ok(AgentEvent::ModelFinished { usage, stop_reason })) => {
                         finished = Some((usage, stop_reason));
@@ -208,9 +214,7 @@ impl Agent {
                 total_tool_calls = total_tool_calls.saturating_add(tool_calls.len() as u32);
                 if total_tool_calls > self.config.max_tool_calls {
                     self.state = AgentState::Failed;
-                    return Err(AgentError::MaxToolCallsExceeded(
-                        self.config.max_tool_calls,
-                    ));
+                    return Err(AgentError::MaxToolCallsExceeded(self.config.max_tool_calls));
                 }
                 for call in tool_calls {
                     self.ensure_not_cancelled().await?;
@@ -380,13 +384,13 @@ fn map_provider_error(error: ProviderError) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::event::{StopReason, Usage};
     use crate::ids::{new_id, MessageId};
     use crate::message::{Part, Role};
     use crate::provider::mock::ScriptedProvider;
     use crate::provider::ProviderStream;
     use crate::tool::read::ReadTool;
+    use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -433,7 +437,10 @@ mod tests {
         vec![
             AgentEvent::TextDelta { text: text.into() },
             AgentEvent::ModelFinished {
-                usage: Usage { input_tokens: 1, output_tokens: 1 },
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
                 stop_reason: StopReason::EndTurn,
             },
         ]
@@ -461,7 +468,12 @@ mod tests {
         );
         let result = agent.submit(user("hello")).await.expect("submit");
 
-        assert_eq!(result, AgentEvent::RunFinished { message: "Hello".into() });
+        assert_eq!(
+            result,
+            AgentEvent::RunFinished {
+                message: "Hello".into()
+            }
+        );
         assert_eq!(agent.state(), AgentState::Finished);
     }
 
@@ -488,8 +500,12 @@ mod tests {
         agent.submit(user("hello")).await.expect("submit");
         let entries = crate::session::read_entries(&path).await.expect("read");
 
-        assert!(matches!(entries.get(1), Some(SessionEntry::UserMessage { content, .. }) if content == "hello"));
-        assert!(matches!(entries.get(2), Some(SessionEntry::AssistantMessage { parts, .. }) if matches!(parts.first(), Some(Part::Text { text }) if text == "Hi")));
+        assert!(
+            matches!(entries.get(1), Some(SessionEntry::UserMessage { content, .. }) if content == "hello")
+        );
+        assert!(
+            matches!(entries.get(2), Some(SessionEntry::AssistantMessage { parts, .. }) if matches!(parts.first(), Some(Part::Text { text }) if text == "Hi"))
+        );
     }
 
     #[tokio::test]
@@ -518,10 +534,7 @@ mod tests {
         assert!(matches!(error, AgentError::MaxTurnsExceeded(1)));
     }
 
-    async fn tool_agent(
-        root: &std::path::Path,
-        turns: Vec<Vec<AgentEvent>>,
-    ) -> Agent {
+    async fn tool_agent(root: &std::path::Path, turns: Vec<Vec<AgentEvent>>) -> Agent {
         let writer = SessionWriter::open(root.join("session.jsonl"))
             .await
             .expect("open session");
@@ -553,7 +566,10 @@ mod tests {
                 args: serde_json::json!({"path": path}),
             },
             AgentEvent::ModelFinished {
-                usage: Usage { input_tokens: 1, output_tokens: 1 },
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
                 stop_reason: StopReason::ToolUse,
             },
         ]
@@ -571,8 +587,16 @@ mod tests {
 
         let result = agent.submit(user("read it")).await.expect("submit");
 
-        assert_eq!(result, AgentEvent::RunFinished { message: "Done".into() });
-        assert!(agent.history.iter().any(|message| message.role == Role::ToolResult));
+        assert_eq!(
+            result,
+            AgentEvent::RunFinished {
+                message: "Done".into()
+            }
+        );
+        assert!(agent
+            .history
+            .iter()
+            .any(|message| message.role == Role::ToolResult));
     }
 
     #[tokio::test]
@@ -593,7 +617,10 @@ mod tests {
             }
         );
         assert!(agent.history.iter().any(|message| {
-            matches!(message.parts.first(), Some(Part::ToolResult { is_error: true, .. }))
+            matches!(
+                message.parts.first(),
+                Some(Part::ToolResult { is_error: true, .. })
+            )
         }));
     }
 
@@ -619,7 +646,10 @@ mod tests {
         let entries = crate::session::read_entries(path).await.expect("read");
 
         assert!(matches!(error, AgentError::Cancelled));
-        assert!(matches!(entries.last(), Some(SessionEntry::RunInterrupted { .. })));
+        assert!(matches!(
+            entries.last(),
+            Some(SessionEntry::RunInterrupted { .. })
+        ));
     }
 
     struct ErrorProvider;
@@ -702,7 +732,10 @@ mod tests {
             });
         }
         calls.push(AgentEvent::ModelFinished {
-            usage: Usage { input_tokens: 1, output_tokens: 1 },
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
             stop_reason: StopReason::ToolUse,
         });
         let mut agent = tool_agent(dir.path(), vec![calls, text_events("Done")]).await;
