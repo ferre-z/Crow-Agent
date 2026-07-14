@@ -2,7 +2,7 @@
 name = "crow"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Small autonomous coding agent"
 license = "MIT"
 
@@ -20,7 +20,7 @@ path = "src/main.rs"
 # at the v1 boundary.
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "process", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "process", "io-util", "signal"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 ulid = { version = "1", features = ["serde"] }
@@ -31,6 +31,16 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tempfile = "3"
+# Wave 2 additions:
+genai = "=0.6.5"
+schemars = "0.8"
+ignore = "0.4"
+similar = "2"
+# Wave 3 additions:
+secrecy = "0.8"
+nix = { version = "0.27", features = ["signal", "process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+assert_cmd = "2"
+predicates = "3"
