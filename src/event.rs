@@ -122,7 +122,7 @@ pub enum StopReason {
 ///
 /// Serialises as a plain JSON string via `#[serde(transparent)]`, e.g.
 /// `ErrorCode("stream_invalid")` → `"stream_invalid"`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct ErrorCode(pub String);
 
