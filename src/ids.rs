@@ -49,6 +49,36 @@ pub struct ToolCallId(pub Ulid);
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ToolResultId(pub Ulid);
 
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session:{}", self.0)
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run:{}", self.0)
+    }
+}
+
+impl std::fmt::Display for MessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "msg:{}", self.0)
+    }
+}
+
+impl std::fmt::Display for ToolCallId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tool_call:{}", self.0)
+    }
+}
+
+impl std::fmt::Display for ToolResultId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tool_result:{}", self.0)
+    }
+}
+
 /// Project-owned timestamp.
 ///
 /// Stored as a [`SystemTime`] but serialized as Unix milliseconds (a JSON
