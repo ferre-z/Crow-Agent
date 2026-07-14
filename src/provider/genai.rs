@@ -27,11 +27,7 @@ impl GenaiProvider {
     /// # Errors
     ///
     /// Returns an upstream `missing_api_key` error when the variable is absent.
-    pub fn from_env(
-        base_url: &str,
-        model: &str,
-        api_key_env: &str,
-    ) -> Result<Self, ProviderError> {
+    pub fn from_env(base_url: &str, model: &str, api_key_env: &str) -> Result<Self, ProviderError> {
         let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::Upstream {
             code: "missing_api_key".to_owned(),
             message: format!("env var {api_key_env} not set"),
@@ -108,6 +104,11 @@ impl Provider for GenaiProvider {
                 };
 
                 let Some(item) = item else {
+                    if let Err(error) = accumulator.finish() {
+                        let _ = sender
+                            .send(Err(ProviderError::StreamInvalid(error.to_string())))
+                            .await;
+                    }
                     break;
                 };
                 let chunks = match item {
@@ -208,7 +209,9 @@ fn event_to_chunks(event: ChatStreamEvent) -> Vec<ProviderChunk> {
 }
 
 fn nonnegative_u32(value: Option<i32>) -> u32 {
-    value.and_then(|value| u32::try_from(value).ok()).unwrap_or(0)
+    value
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
 }
 
 fn map_stop_reason(reason: Option<genai::chat::StopReason>) -> StopReason {
@@ -218,9 +221,7 @@ fn map_stop_reason(reason: Option<genai::chat::StopReason>) -> StopReason {
         Some(genai::chat::StopReason::ContentFilter(_) | genai::chat::StopReason::Other(_)) => {
             StopReason::Error
         }
-        Some(
-            genai::chat::StopReason::Completed(_) | genai::chat::StopReason::StopSequence(_),
-        )
+        Some(genai::chat::StopReason::Completed(_) | genai::chat::StopReason::StopSequence(_))
         | None => StopReason::EndTurn,
     }
 }
@@ -228,14 +229,15 @@ fn map_stop_reason(reason: Option<genai::chat::StopReason>) -> StopReason {
 #[cfg(test)]
 mod tests {
     use genai::chat::{
-        ChatStreamEvent, StopReason as GenaiStopReason, StreamChunk, StreamEnd, ToolCall,
-        ToolChunk,
+        ChatStreamEvent, StopReason as GenaiStopReason, StreamChunk, StreamEnd, ToolCall, ToolChunk,
     };
     use serde_json::json;
 
     use super::GenaiProvider;
-    use crate::event::{StopReason, Usage};
-    use crate::provider::ProviderChunk;
+    use crate::event::{AgentEvent, StopReason, Usage};
+    use crate::provider::{
+        ModelRequest, Provider, ProviderChunk, ProviderError, StreamAccumulator,
+    };
 
     #[test]
     fn from_env_missing_key_returns_err() {
@@ -261,17 +263,28 @@ mod tests {
 
     #[test]
     fn start_and_text_events_map_to_provider_chunks() {
-        assert!(matches!(
-            super::event_to_chunks(ChatStreamEvent::Start).as_slice(),
-            [ProviderChunk::Started]
-        ));
-        let chunks = super::event_to_chunks(ChatStreamEvent::Chunk(StreamChunk {
-            content: "hello".to_owned(),
-        }));
-        assert!(matches!(
-            chunks.as_slice(),
-            [ProviderChunk::TextDelta { text }] if text == "hello"
-        ));
+        let native_events = [
+            ChatStreamEvent::Start,
+            ChatStreamEvent::Chunk(StreamChunk {
+                content: "hello".to_owned(),
+            }),
+        ];
+        let mut accumulator = StreamAccumulator::new();
+        let events = native_events
+            .into_iter()
+            .flat_map(super::event_to_chunks)
+            .flat_map(|chunk| accumulator.push_chunk(chunk).expect("valid chunk"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ModelStarted,
+                AgentEvent::TextDelta {
+                    text: "hello".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -302,6 +315,17 @@ mod tests {
                 ProviderChunk::ToolArgumentsDelta { call_id: delta, .. },
                 ProviderChunk::ToolCallComplete { call_id: complete },
             ) if start == delta && delta == complete
+        ));
+
+        let mut accumulator = StreamAccumulator::new();
+        let events = chunks
+            .into_iter()
+            .flat_map(|chunk| accumulator.push_chunk(chunk).expect("valid tool chunk"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ToolStarted { name, args, .. }]
+                if name == "read" && args == &json!({"path": "README.md"})
         ));
     }
 
@@ -343,5 +367,28 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_request_does_not_open_network_stream() {
+        let provider = GenaiProvider::with_api_key(
+            "https://example.invalid/v1",
+            "test-model",
+            "test-key".to_owned(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let result = provider
+            .stream(
+                ModelRequest {
+                    messages: Vec::new(),
+                    tools_schema: serde_json::Value::Null,
+                },
+                cancel,
+            )
+            .await;
+
+        assert!(matches!(result, Err(ProviderError::Cancelled)));
     }
 }
