@@ -13,6 +13,7 @@ pub mod cancel;
 pub mod event;
 pub mod ids;
 pub mod message;
+pub mod provider;
 pub mod session;
 pub mod session_entry;
 
@@ -20,5 +21,6 @@ pub use cancel::{timeout_or_cancel, CancelOutcome, CancellationToken};
 pub use event::*;
 pub use ids::*;
 pub use message::*;
-pub use session::*;
+pub use provider::{mock, Provider, ScriptedProvider};
+pub use session::Session;
 pub use session_entry::*;
