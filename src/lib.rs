@@ -9,11 +9,13 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
 
+pub mod cancel;
 pub mod event;
 pub mod ids;
 pub mod message;
 pub mod session_entry;
 
+pub use cancel::{timeout_or_cancel, CancelOutcome, CancellationToken};
 pub use event::*;
 pub use ids::*;
 pub use message::*;
