@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "process", "io-util"] }
+tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 ulid = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

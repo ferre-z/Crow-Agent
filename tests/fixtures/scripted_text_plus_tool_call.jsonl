@@ -1,0 +1,8 @@
+{"type":"ModelStarted"}
+{"type":"TextDelta","text":"Let me check that. "}
+{"type":"ToolStarted","call_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","name":"shell","args":{"cmd":"ls"}}
+{"type":"ToolOutput","call_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","stream":"stdout","chunk":[104,101,108,108,111,10]}
+{"type":"ToolFinished","call_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{"Success":{"output":"hello\n","truncated":false}}}
+{"type":"TextDelta","text":"Done. "}
+{"type":"ModelFinished","usage":{"input_tokens":12,"output_tokens":4},"stop_reason":"EndTurn"}
+{"type":"RunFinished","message":"done"}

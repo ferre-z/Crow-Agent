@@ -13,6 +13,7 @@ pub mod cancel;
 pub mod event;
 pub mod ids;
 pub mod message;
+pub mod provider;
 pub mod session_entry;
 
 pub use cancel::{timeout_or_cancel, CancelOutcome, CancellationToken};
