@@ -10,6 +10,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod cancel;
+pub mod context;
 pub mod event;
 pub mod ids;
 pub mod message;
