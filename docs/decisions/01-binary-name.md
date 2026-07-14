@@ -16,6 +16,5 @@ Binary name: `crow`. Library crate name: `crow`. Config directory: `~/.config/cr
 
 ## Consequences
 
-- Spec §8 config example needs a one-line update (rename `[provider]` block is unchanged; only paths). Will be patched in wave 2 once we know the file shape.
-- All tests, docs, fixture filenames use `crow` (not `pale`).
-- The `80 Workspace/Crow/` vault folder name stays.
+- **Spec §8 conflict:** the spec mandates `pale` as the binary name and `~/.config/pale/` for config. We diverge. Rationale: the project folder is named `Crow` and AGENTS.md uses "Crow" throughout — Ferre explicitly chose the rename on 2026-07-14 to keep naming consistent across vault, repo, binary, and config. If/when the spec is updated, this decision can be reverted.
+- The `01-binary-name.md` decision log is the source of truth; spec §8 should be patched in a later revision to match.

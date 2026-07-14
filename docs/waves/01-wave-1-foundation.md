@@ -147,38 +147,49 @@ impl Conversation {
 - Create: `src/cancel.rs`
 - Modify: `src/lib.rs` (re-export)
 
-**Spec references:** v0 spec §4 (cancellation), §11 (cancellation in loop).
+**Spec references:** v0 spec §4 (cancellation), §9 (Provider trait takes `CancellationToken`), §11 (cancellation in loop).
+
+**CRITICAL — spec alignment:** the v0 spec §9 `Provider` trait takes `tokio_util::sync::CancellationToken` directly. We do NOT invent a `CancelScope` wrapper. This task adds two things:
+1. A small `cancel.rs` module that **re-exports `tokio_util::sync::CancellationToken`** under a stable alias, and provides a `timeout_or_cancel(future, token, timeout)` helper used throughout the crate.
+2. A documented convention for the hierarchy: process → session → run → provider/tool. Each level holds a `CancellationToken`; cancelling the parent cancels all children (this is `tokio_util`'s built-in `child_token()` behaviour, not something we reimplement).
 
 **Interfaces (exact):**
 
 ```rust
 // cancel.rs
+pub use tokio_util::sync::CancellationToken;  // re-export for the rest of the crate
+
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Default)]
-pub struct CancelScope { /* ... */ }
+/// Run `future` to completion, or return whichever happens first:
+/// - the future completes -> Ok(T)
+/// - the cancellation token fires -> Err(CancelOutcome::Cancelled)
+/// - the timeout elapses -> Err(CancelOutcome::TimedOut)
+pub async fn timeout_or_cancel<T>(
+    token: CancellationToken,
+    timeout: Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, CancelOutcome>;
 
-impl CancelScope {
-    pub fn new() -> Self;
-    pub fn root(&self) -> CancellationToken;
-    pub fn child(&self) -> (CancelScope, CancellationToken);
-    pub fn cancel(&self);
-    pub fn is_cancelled(&self) -> bool;
-    pub async fn cancelled(&self) -> ();
-    pub async fn cancelled_or_timeout(&self, timeout: Duration) -> CancelOutcome;
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CancelOutcome {
+    #[error("cancelled")] Cancelled,
+    #[error("timed out")] TimedOut,
 }
 
-pub enum CancelOutcome { Cancelled, TimedOut }
+/// Convention: every long-running task that takes a `CancellationToken`
+/// also has a `timeout: Duration` from `Config`. Callers MUST use
+/// `timeout_or_cancel(token, timeout, fut)` and propagate `CancelOutcome`
+/// as a typed error, never panic.
 ```
 
 **Acceptance:**
-- Child cancellation propagates upward only on demand (default: child cancel does NOT cancel parent — that's parent-only)
-- Parent cancel cancels all children
-- `cancelled_or_timeout(1ms)` returns within 50ms even on a healthy token
-- Tests: 6+ cases — child cancel does not affect parent, parent cancel affects child, timeout fires, double cancel is idempotent, drop cancels child
+- `CancellationToken` is the only cancellation primitive in the public API
+- `timeout_or_cancel` returns within 50ms of the timeout on a healthy future
+- Tests: 8+ cases — token cancel before timeout, timeout fires first, future completes, future completes past timeout (timeout returns TimedOut, future is dropped), nested child tokens cancel with parent, child cancel does not cancel parent, token dropped cancels children, double cancel is idempotent
+- All public functions have `///` doc comments
 
-**Forbidden:** No `unsafe`. No global state. No `tokio::spawn` from inside.
+**Forbidden:** No `unsafe`. No global state. No `tokio::spawn` from inside `cancel.rs`. No re-implementing `CancellationToken` — we re-export and build on it.
 
 ---
 
@@ -248,7 +259,7 @@ pub async fn list_sessions(dir: impl AsRef<std::path::Path>) -> Result<Vec<Sessi
 ```rust
 // provider/mod.rs
 use async_trait::async_trait;
-use crate::cancel::CancelScope;
+use tokio_util::sync::CancellationToken;
 use crate::event::{AgentEvent, Usage, StopReason};
 
 pub struct ModelRequest { pub messages: Vec<crate::message::Message>, pub tools_schema: serde_json::Value }
@@ -266,7 +277,11 @@ pub struct ProviderStream {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
-    async fn stream(&self, req: ModelRequest, cancel: crate::cancel::CancelScope) -> Result<ProviderStream, ProviderError>;
+    async fn stream(
+        &self,
+        req: ModelRequest,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError>;
 }
 ```
 
@@ -280,7 +295,7 @@ impl ScriptedProvider {
 }
 ```
 
-**Fixture format (one event per JSON line):**
+**Fixture format (one event per JSON line, using `#[serde(tag = "type")]` on `AgentEvent`):**
 ```json
 {"type":"ModelStarted"}
 {"type":"TextDelta","text":"Hello"}
@@ -288,6 +303,10 @@ impl ScriptedProvider {
 {"type":"ModelFinished","usage":{"input_tokens":5,"output_tokens":2},"stop_reason":"EndTurn"}
 {"type":"RunFinished","message":"done"}
 ```
+
+**Implementation note:** the `AgentEvent` enum in `src/event.rs` MUST be defined with `#[serde(tag = "type")]` and field names matching the fixture (e.g. `TextDelta(String)`, not `TextDelta { text: String }`). This is the explicit contract — the fixture format is the spec. Variant names use PascalCase: `ModelStarted`, `TextDelta`, `ReasoningDelta`, `ToolStarted`, `ToolOutput`, `ToolFinished`, `ModelFinished`, `RunStarted`, `RunFinished`, `RunCancelled`, `RunFailed`.
+
+**Stop reason format:** `{"type":"ModelFinished","usage":{...},"stop_reason":"EndTurn"}` — `StopReason` serializes to its variant name as a string (not nested), so it needs `#[serde(rename_all = "PascalCase")]` and the corresponding `#[serde(rename_all_fields = "...")]` for the inner data. `RunStarted` carries `{run_id, session_id, started_at}`; `RunFinished` carries `{message}`; `RunFailed` carries `{code, message, retryable}`.
 
 **Acceptance:**
 - `ScriptedProvider::from_fixture` loads JSONL, deserializes each line into `AgentEvent`

@@ -347,8 +347,7 @@ mod tests {
         let path = dir.path().join("fixture.jsonl");
         std::fs::write(&path, "{\"type\":\"QuantumFluxDelta\",\"text\":\"wat\"}\n")
             .expect("write fixture");
-        let err = ScriptedProvider::from_fixture(&path)
-            .expect_err("unknown type should error");
+        let err = ScriptedProvider::from_fixture(&path).expect_err("unknown type should error");
         match err {
             ProviderError::StreamInvalid(msg) => {
                 assert!(
@@ -371,8 +370,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("fixture.jsonl");
         std::fs::write(&path, "").expect("write fixture");
-        let err = ScriptedProvider::from_fixture(&path)
-            .expect_err("empty file should error");
+        let err = ScriptedProvider::from_fixture(&path).expect_err("empty file should error");
         match err {
             ProviderError::StreamInvalid(msg) => {
                 assert!(
@@ -389,8 +387,8 @@ mod tests {
     #[tokio::test]
     async fn whitespace_only_file_fails_loudly() {
         let path = write_fixture("\n   \n\t\n");
-        let err = ScriptedProvider::from_fixture(&path)
-            .expect_err("whitespace-only file should error");
+        let err =
+            ScriptedProvider::from_fixture(&path).expect_err("whitespace-only file should error");
         assert!(matches!(err, ProviderError::StreamInvalid(_)));
     }
 
@@ -401,8 +399,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("fixture.jsonl");
         std::fs::write(&path, "not json\n").expect("write fixture");
-        let err = ScriptedProvider::from_fixture(&path)
-            .expect_err("malformed JSON should error");
+        let err = ScriptedProvider::from_fixture(&path).expect_err("malformed JSON should error");
         match err {
             ProviderError::StreamInvalid(msg) => {
                 assert!(
