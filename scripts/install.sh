@@ -193,9 +193,32 @@ install_packages() {
 
 # Install Rust via rustup. Uses curl (which we ensured above).
 install_rust() {
+  # Pre-flight: rustup-init needs to extract the rustup-init binary
+  # into a tmp file. If there's no space, fail with a clear message
+  # rather than getting a cryptic curl: (23) later.
+  if [ -d /tmp ]; then
+    local tmp_avail_kib tmp_need_kib=51200  # 50 MiB
+    tmp_avail_kib=$(df -k /tmp 2>/dev/null | awk 'NR==2 { print $4 }')
+    if [ -n "$tmp_avail_kib" ] && [ "$tmp_avail_kib" -lt "$tmp_need_kib" ]; then
+      echo "" >&2
+      echo "install.sh: not enough free space in /tmp for rustup-init" >&2
+      echo "  available: $((tmp_avail_kib / 1024)) MiB" >&2
+      echo "  need:      ~50 MiB" >&2
+      echo "" >&2
+      echo "  Free up space in /tmp (e.g. 'rm -rf /tmp/tmp.*' or 'sudo tmpreaper')" >&2
+      echo "  and re-run this script." >&2
+      exit 1
+    fi
+  fi
+
   echo "install.sh: installing Rust toolchain via rustup (channel ${rust_toolchain})"
   local url="https://sh.rustup.rs"
-  curl --proto '=https' --tlsv1.2 -sSf "$url" | \
+  # `--retry 3` survives the intermittent flake that intermittently
+  # truncates the rustup-init download. RUSTUP_AUTO_INSTALL=0 stops
+  # rustup-init from trying to download *another* toolchain on top
+  # of what we ask for, which can hang on slow networks.
+  RUSTUP_AUTO_INSTALL=0 \
+  curl --proto '=https' --tlsv1.2 -sSf --retry 3 "$url" | \
     sh -s -- -y \
       --default-toolchain "$rust_toolchain" \
       --profile minimal \
@@ -223,15 +246,22 @@ if [ "$bootstrap" = "1" ]; then
 
   # Step 2: install Rust if missing. This is the biggest win — most
   # users won't have cargo on a fresh box.
-  if ! have cargo || ! have rustc; then
-    install_rust
+  #
+  # We check in this order:
+  #   a) ~/.cargo/bin/rustup exists           -> source env, skip bootstrap
+  #                                              (rustup is already installed; just
+  #                                              make sure cargo is on PATH)
+  #   b) cargo + rustc both on PATH              -> nothing to do
+  #   c) cargo or rustc missing                 -> install rustup non-interactively
+  #                                              with retries
+  if [ -x "$HOME/.cargo/bin/rustup" ]; then
+    echo "install.sh: rustup already installed at ~/.cargo/bin/rustup; reusing"
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+  elif have cargo && have rustc; then
+    echo "install.sh: cargo + rustc on PATH; no bootstrap needed"
   else
-    # Cargo exists. Make sure the pinned toolchain is available; rustup
-    # auto-installs from rust-toolchain.toml when invoked.
-    if have rustup && [ -f rust-toolchain.toml ]; then
-      # No-op: rustup itself honours rust-toolchain.toml per-directory.
-      :
-    fi
+    install_rust
   fi
 
   # Step 3: install git and make (and curl is now confirmed above).
