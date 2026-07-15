@@ -4,34 +4,46 @@ A small autonomous coding agent in Rust. Mirrors the workflow of Pi, Claude Code
 
 The first milestone is a reliable personal tool, not a platform. Keep the kernel small and extensible.
 
+---
+
 ## Quick start
 
-Install (one line):
+**Install (one line):**
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/ferre-z/Crow-Agent/main/scripts/install.sh | sh
 ```
 
-The installer clones the repo, builds a **debug** binary (small disk footprint, fits on disk-quota boxes), copies it into `~/.cargo/bin/crow`, then `cargo clean`s the build artifacts so the only thing left behind is the source clone and the installed binary. To get an optimised release build, pass `--release`.
-
-**It auto-installs any missing dependencies** — Rust via rustup, basic build tools via your system package manager — so it works on a clean box with no prior setup. Linux and macOS only (Windows is blocked upstream by the `nix` crate; pass `--no-bootstrap` to opt out).
-
-Test from a fresh clone (one line):
+**Test from a fresh clone (one line):**
 
 ```bash
 git clone https://github.com/ferre-z/Crow-Agent.git /tmp/crow && cd /tmp/crow && make test
 ```
 
-The test suite is fully deterministic — no API key, no network required.
-
-Try it:
+**Try it:**
 
 ```bash
 crow --version
 crow doctor
 ```
 
-Other useful targets: `make build`, `make install-release`, `make lint`, `make smoke`, `make ci`. Run `make help` for the full list.
+The installer **auto-installs missing dependencies** (Rust via rustup, `git` / `make` / `curl` via your package manager) so it works on a clean box. Linux and macOS only (Windows blocked by the `nix` crate). Pass `--no-bootstrap` to opt out.
+
+Default install uses the **debug** profile so it fits on disk-quota boxes (no `quota exceeded` errors). For an optimised binary, pass `--release`.
+
+### All commands at a glance
+
+| Goal | Command |
+|---|---|
+| Install | `curl -sSf https://raw.githubusercontent.com/ferre-z/Crow-Agent/main/scripts/install.sh \| sh` |
+| Test | `git clone https://github.com/ferre-z/Crow-Agent.git /tmp/crow && cd /tmp/crow && make test` |
+| Build release | `cargo build --release` (or `make build`) |
+| Install release | `curl -sSf .../install.sh \| sh -s -- --release` |
+| Verify config | `crow doctor` |
+| Build the kernel + run all 225 tests | `make ci` |
+| See every Makefile target | `make help` |
+
+---
 
 ## Status
 
