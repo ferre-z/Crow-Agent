@@ -1,0 +1,338 @@
+//! Clap subcommand definitions and the binary entry point.
+//!
+//! `crow` is a small CLI: the subcommands are `exec`, `sessions`,
+//! `resume`, and `doctor`. Top-level flags include `--version` and
+//! `--resume <id>`. Most options thread through [`ConfigOverrides`]
+//! so the layered configuration still applies.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use secrecy::ExposeSecret;
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::{Agent, AgentConfig};
+use crate::config::{Config, ConfigOverrides};
+use crate::event::ChannelSink;
+use crate::message::{Message, Part, Role};
+use crate::provider::mock::ScriptedProvider;
+use crate::provider::Provider;
+use crate::session::{self, SessionMeta};
+use crate::tool::{BashTool, EditTool, ReadTool, ToolRegistry, WriteTool};
+
+/// Command-line arguments parsed by clap.
+#[derive(Debug, Parser)]
+#[command(name = "crow", version, about = "Small autonomous coding agent")]
+pub struct Cli {
+    /// Project root for the invocation (overrides env + config).
+    #[arg(long, global = true)]
+    pub project_root: Option<PathBuf>,
+
+    /// Resume an existing session by id.
+    #[arg(long, global = true, value_name = "SESSION_ID")]
+    pub resume: Option<String>,
+
+    /// Base URL for the OpenAI-compatible endpoint (overrides env).
+    #[arg(long, global = true)]
+    pub base_url: Option<String>,
+
+    /// Model name passed to the provider (overrides env).
+    #[arg(long, global = true)]
+    pub model: Option<String>,
+
+    /// API key for the provider (overrides env + keyring).
+    #[arg(long, global = true, hide_env_values = true)]
+    pub api_key: Option<String>,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Subcommands.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Run a one-shot prompt against the agent loop and print the
+    /// final assistant message.
+    Exec {
+        /// Prompt text to send.
+        prompt: String,
+    },
+    /// List every session in the active project's sessions directory,
+    /// newest first.
+    Sessions,
+    /// Resume an existing session by id and submit a new prompt.
+    Resume {
+        /// Session id (full or prefix).
+        session_id: String,
+        /// Prompt to send after resume.
+        prompt: String,
+    },
+    /// Print diagnostic information about the current configuration
+    /// and provider setup. Use `--live` to also probe the network.
+    Doctor {
+        /// Ping the configured provider endpoint.
+        #[arg(long)]
+        live: bool,
+    },
+    /// Run the local app-server: line-delimited JSON-RPC over stdio.
+    /// Used by the Tauri desktop (and external CLIs in any language)
+    /// to drive the kernel without linking it.
+    Serve,
+}
+
+/// Run the CLI based on parsed args. Returns `Ok` on a successful
+/// run, `Err` on a fatal error.
+#[allow(clippy::missing_errors_doc)]
+pub async fn run(args: Cli) -> Result<()> {
+    // Tracing to stderr; stdout is reserved for the user-facing
+    // protocol output of each subcommand.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("crow=info,warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let cli_overrides = ConfigOverrides {
+        base_url: args.base_url.clone(),
+        model: args.model.clone(),
+        api_key: args.api_key.clone(),
+        max_turns: None,
+        max_tool_calls: None,
+        project_root: args.project_root.clone(),
+    };
+    let config = Config::load(cli_overrides)
+        .await
+        .context("loading config")?;
+    let resume_id = args.resume.clone();
+    match args.command {
+        Command::Exec { prompt } => exec(&config, resume_id.as_deref(), prompt).await,
+        Command::Sessions => sessions(&config).await,
+        Command::Resume { session_id, prompt } => resume(&config, session_id, prompt).await,
+        Command::Doctor { live } => doctor(&config, live).await,
+        Command::Serve => crate::app_server::run().await,
+    }
+}
+
+async fn exec(config: &Config, resume_id: Option<&str>, prompt: String) -> Result<()> {
+    let provider = build_provider(config)?;
+    let tools = default_registry();
+    let sessions_dir = sessions_dir_for(config);
+    tokio::fs::create_dir_all(&sessions_dir)
+        .await
+        .context("creating sessions directory")?;
+    let session_path = new_session_path(&sessions_dir);
+
+    // Resume if a session id was provided.
+    let cancel = CancellationToken::new();
+    let user_msg = Message {
+        id: crate::ids::MessageId(crate::ids::new_id()),
+        role: Role::User,
+        parts: vec![Part::Text { text: prompt }],
+    };
+    let mut agent = if let Some(session_id) = resume_id {
+        let path = resolve_session_id(&sessions_dir, session_id)
+            .await
+            .with_context(|| format!("resolving session id {session_id}"))?;
+        let writer = session::SessionWriter::open(&path)
+            .await
+            .with_context(|| format!("opening session log {path:?}"))?;
+        let cfg = AgentConfig::new(
+            config.max_turns,
+            config.max_tool_calls,
+            config.model.clone(),
+            config.project_root.clone(),
+            writer,
+        );
+        let (agent_sink, _rx) = ChannelSink::new(256);
+        let (agent, _history) = Agent::resume_into(
+            cfg,
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            tools,
+            cancel,
+            Arc::new(agent_sink),
+            &path,
+        )
+        .await
+        .context("rebuilding session")?;
+        agent
+    } else {
+        let writer = session::SessionWriter::open(&session_path)
+            .await
+            .context("opening session log")?;
+        let cfg = AgentConfig::new(
+            config.max_turns,
+            config.max_tool_calls,
+            config.model.clone(),
+            config.project_root.clone(),
+            writer,
+        );
+        Agent::new(
+            cfg,
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            tools,
+            cancel,
+            Vec::new(),
+        )
+    };
+
+    let final_event = agent.submit(user_msg).await.context("agent loop")?;
+    if let crate::event::AgentEvent::RunFinished { message } = final_event {
+        println!("{message}");
+    }
+    Ok(())
+}
+
+async fn sessions(config: &Config) -> Result<()> {
+    let dir = sessions_dir_for(config);
+    if !dir.exists() {
+        println!("no sessions directory at {}", dir.display());
+        return Ok(());
+    }
+    let metas = session::list_sessions(&dir)
+        .await
+        .context("listing sessions")?;
+    if metas.is_empty() {
+        println!("no sessions");
+        return Ok(());
+    }
+    for SessionMeta {
+        session_id,
+        started_at,
+        schema_version: _,
+        path,
+    } in metas
+    {
+        println!(
+            "{}  {}  {}",
+            session_id,
+            format_timestamp(started_at),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Human-readable timestamp for CLI output.
+fn format_timestamp(ts: crate::ids::Timestamp) -> String {
+    let dur =
+        ts.0.duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+    let secs = dur.as_secs();
+    // Render as `YYYY-MM-DDTHH:MM:SSZ` from the epoch second. We avoid
+    // pulling in `chrono`; a small inline formatter is enough for v0.
+    let (year, month, day, hour, minute, second) = epoch_to_civil(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Howard Hinnant's date algorithm: convert Unix seconds to
+/// (year, month, day, hour, minute, second) in UTC. Returns sentinel
+/// zeros for pre-1970 inputs.
+fn epoch_to_civil(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = (rem / 3600) as u32;
+    let minute = ((rem % 3600) / 60) as u32;
+    let second = (rem % 60) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = (if m <= 2 { y + 1 } else { y }) as i32;
+    (year, m, d, hour, minute, second)
+}
+
+async fn resume(config: &Config, session_id: String, prompt: String) -> Result<()> {
+    exec(config, Some(&session_id), prompt).await
+}
+
+async fn doctor(config: &Config, live: bool) -> Result<()> {
+    println!("crow doctor");
+    println!("  model:         {}", config.model);
+    println!("  base_url:      {}", config.base_url);
+    println!(
+        "  api_key_env:   {}",
+        if config.api_key.expose_secret().is_empty() {
+            "(not set)"
+        } else {
+            "(set)"
+        }
+    );
+    println!("  project_root:  {}", config.project_root.display());
+    println!("  sessions_dir:  {}", sessions_dir_for(config).display());
+    println!("  max_turns:     {}", config.max_turns);
+    println!("  max_tool_calls: {}", config.max_tool_calls);
+    if live {
+        let provider = build_provider(config)?;
+        let _ = provider; // presence proves construction worked.
+        println!("  live check:    ok (provider constructed; no stream call)");
+    }
+    Ok(())
+}
+
+/// Build a provider. Tries `genai` first; if the API key is empty,
+/// falls back to the scripted mock so `crow doctor` and unit-test
+/// flows still work without network.
+fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
+    let key = config.api_key.expose_secret();
+    if !key.is_empty() {
+        let provider = crate::provider::genai::GenaiProvider::with_api_key(
+            &config.base_url,
+            &config.model,
+            key.to_string(),
+        );
+        let arc: Arc<dyn Provider> = Arc::new(provider);
+        return Ok(arc);
+    }
+    tracing::warn!("no API key configured; using scripted mock provider");
+    Ok(Arc::new(ScriptedProvider::from_events(Vec::new())))
+}
+
+/// Default registry for the CLI: ships `read`, `write`, `edit`,
+/// and `bash`. Plan mode (wave 7) will switch to a read-only subset
+/// of this.
+pub fn default_registry() -> Arc<ToolRegistry> {
+    let mut reg = ToolRegistry::new();
+    reg.register(ReadTool);
+    reg.register(WriteTool);
+    reg.register(EditTool);
+    reg.register(BashTool);
+    Arc::new(reg)
+}
+
+/// Build a path for a fresh session log under `dir`. Filename is a
+/// ULID so the file is sortable + unique.
+fn new_session_path(dir: &std::path::Path) -> PathBuf {
+    dir.join(format!("{}.jsonl", ulid::Ulid::new()))
+}
+
+/// `sessions_dir` is `<project_root>/.crow/sessions` to keep each
+/// project's sessions self-contained.
+fn sessions_dir_for(config: &Config) -> PathBuf {
+    config.project_root.join(".crow").join("sessions")
+}
+
+/// Resolve a session id (full or prefix) to its JSONL path.
+async fn resolve_session_id(dir: &std::path::Path, id_or_prefix: &str) -> Result<PathBuf> {
+    let metas = session::list_sessions(dir).await?;
+    let matches: Vec<&SessionMeta> = metas
+        .iter()
+        .filter(|m| m.session_id.0.to_string().starts_with(id_or_prefix))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0].path.clone()),
+        n if n > 1 => {
+            anyhow::bail!(
+                "session id prefix {id_or_prefix:?} matched {n} sessions; be more specific"
+            )
+        }
+        _ => anyhow::bail!("no session matched {id_or_prefix:?}"),
+    }
+}
