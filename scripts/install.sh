@@ -5,13 +5,17 @@
 #   curl -sSf https://raw.githubusercontent.com/ferre-z/Crow-Agent/main/scripts/install.sh | sh
 #
 # Modes:
-#   default           : clone -> cargo install -> verify -> print PATH hint
+#   default           : clone -> debug build + copy -> cargo clean -> verify
+#   --release         : release build via `cargo install --path . --locked`
+#                        (larger peak disk usage)
 #   --test            : clone -> run `make test` (no install)
 #   --path <DIR>      : use DIR as the working directory (default $TMPDIR/crow-install-$$)
 #   --branch <REF>    : git ref to clone (default: main)
 #   --repo <URL>      : git URL (default: https://github.com/ferre-z/Crow-Agent.git)
 #   --no-bootstrap    : skip auto-install of missing tools
 #   --no-path-hint    : skip the PATH export reminder
+#   --no-clean        : skip `cargo clean` after install (debug mode only)
+#   -y, --yes         : skip the disk-quota preflight check
 #
 # Auto-bootstraps:
 #   - Rust toolchain via rustup if `cargo` is missing. Non-interactive,
@@ -32,9 +36,12 @@ BRANCH_DEFAULT="main"
 repo="$REPO_DEFAULT"
 branch="$BRANCH_DEFAULT"
 mode="install"
+build_profile="debug"  # default; override with --release
 workdir=""
 print_path_hint=1
 bootstrap=1
+clean_after=1          # default for debug install
+yes_preflight=0
 bin_name="crow"
 rust_toolchain="1.88"
 
@@ -78,6 +85,7 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --test)           mode="test"; shift ;;
+    --release)        build_profile="release"; clean_after=0; shift ;;
     --path)           workdir="${2:-}"; shift 2 || { echo "install.sh: --path requires an argument" >&2; exit 1; } ;;
     --path=*)         workdir="${1#*=}"; shift ;;
     --branch)         branch="${2:-}"; shift 2 || { echo "install.sh: --branch requires an argument" >&2; exit 1; } ;;
@@ -86,6 +94,8 @@ while [ $# -gt 0 ]; do
     --repo=*)         repo="${1#*=}"; shift ;;
     --no-bootstrap)   bootstrap=0; shift ;;
     --no-path-hint)   print_path_hint=0; shift ;;
+    --no-clean)       clean_after=0; shift ;;
+    -y|--yes)         yes_preflight=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *)                echo "install.sh: unknown argument: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -282,6 +292,47 @@ fi
 
 cd "$workdir"
 
+# --- disk-space preflight (install mode only) --------------------------------
+# Crow's deps pull ~150 crates. A release build needs ~600 MiB peak;
+# debug ~250 MiB. On disk-quota systems this fails late with a
+# cryptic "Disk quota exceeded" — fail fast with a clear number.
+maybe_preflight_disk() {
+  # Pick the directory we're going to build in. The workdir is set by
+  # this point.
+  local probe_dir="$workdir"
+  if [ ! -d "$probe_dir" ]; then
+    # About to clone there; probe the parent (or $TMPDIR).
+    probe_dir="$(dirname "$workdir")"
+  fi
+  # `df -k` prints "Filesystem 1024-blocks Used Available Capacity Mounted"
+  # Available is in KiB. macOS `df -k` is the same shape.
+  local avail_kib
+  avail_kib=$(df -k "$probe_dir" 2>/dev/null | awk 'NR==2 { print $4 }')
+  if [ -z "$avail_kib" ]; then
+    return 0
+  fi
+  # Required peak (debug ~= 250 MiB). Round up to 300 MiB to give
+  # slack; warn or fail below that.
+  local need_kib=$((300 * 1024))
+  if [ "$avail_kib" -lt "$need_kib" ]; then
+    local avail_mib=$((avail_kib / 1024))
+    echo "" >&2
+    echo "install.sh: not enough free disk at $probe_dir" >&2
+    echo "  available: ${avail_mib} MiB" >&2
+    echo "  need (debug build): ~300 MiB" >&2
+    echo "  need (release build with --release): ~600 MiB" >&2
+    echo "" >&2
+    if [ "$yes_preflight" = "0" ]; then
+      echo "  Refusing to proceed. Either:" >&2
+      echo "   - free up disk space and retry" >&2
+      echo "   - re-run with --no-bootstrap to bypass (cannot bypass preflight)" >&2
+      echo "   - re-run with -y if you really want me to try anyway" >&2
+      exit 1
+    fi
+    echo "install.sh: continuing anyway (-y given)" >&2
+  fi
+}
+
 # --- run --------------------------------------------------------------------
 run_cargo_in_step() {
   # $1 = sub-step verb, $2.. = cargo args
@@ -293,6 +344,7 @@ run_cargo_in_step() {
 
 case "$mode" in
   test)
+    maybe_preflight_disk
     echo "install.sh: running test suite"
     if have make; then
       make test
@@ -304,17 +356,34 @@ case "$mode" in
     echo "install.sh: tests passed"
     ;;
   install)
-    echo "install.sh: building and installing to $install_bin"
-    if have make; then
-      make install
+    maybe_preflight_disk
+    if [ "$build_profile" = "release" ]; then
+      echo "install.sh: building (release profile) and installing to $install_bin"
+      if have make; then
+        make install-release
+      else
+        # 'cargo install' defaults to release build.
+        run_cargo_in_step "install" install --path . --locked
+      fi
     else
-      run_cargo_in_step "install" install --path . --locked
+      echo "install.sh: building (debug profile) and installing to $install_bin"
+      # Debug build is much smaller on disk and fits on quota-limited
+      # boxes. We copy the binary to ~/.cargo/bin and then `cargo
+      # clean` so the build artifacts (~250 MiB) don't stick around.
+      run_cargo_in_step "build" build --locked
+      install -d "$CARGO_HOME/bin"
+      install -m 0755 target/debug/$bin_name "$install_bin"
+      if [ "$clean_after" = "1" ]; then
+        echo "install.sh: cleaning build artifacts"
+        cargo clean >/dev/null 2>&1 || true
+      fi
     fi
     echo ""
     echo "install.sh: installed."
     if [ -x "$install_bin" ]; then
       echo "  path: $install_bin"
       echo "  version: $($install_bin --version)"
+      echo "  profile: $build_profile"
     else
       echo "install.sh: WARNING: $install_bin not found after install" >&2
       exit 1
@@ -335,6 +404,10 @@ case "$mode" in
     echo "  $bin_name doctor"
     if [ -z "${NVIDIA_API_KEY:-}" ] && [ -z "${CROW_API_KEY:-}" ]; then
       echo "  (doctor will warn 'no API key configured' — that's the mock-provider fallback.)"
+    fi
+    if [ "$build_profile" = "debug" ]; then
+      echo ""
+      echo "  Tip: pass --release to install.sh for an optimised binary."
     fi
     ;;
 esac

@@ -23,13 +23,14 @@
 CARGO      ?= cargo
 RUSTFLAGS  ?=
 BIN        := crow
+PROFILE    ?= debug  # set to "release" for install-release
 CARGO_HOME ?= $(HOME)/.cargo
 INSTALL_BIN := $(CARGO_HOME)/bin/$(BIN)
 
 # Default goal. Run `make help` for the catalogue.
 .DEFAULT_GOAL := help
 
-.PHONY: help all build test lint fmt fmt-check install run smoke ci clean
+.PHONY: help all build test lint fmt fmt-check install install-release run smoke ci clean
 
 # `help` self-documents by grepping `# help ` comments from this file.
 # Output is plain for CI logs (no colour).
@@ -57,7 +58,22 @@ fmt:  ## apply rustfmt
 fmt-check:  ## verify rustfmt without changing files
 	$(CARGO) fmt --all -- --check
 
-install:  ## `cargo install --path .` into $(INSTALL_BIN)
+# Default install: DEBUG build. Smaller on disk than release; fits
+# on disk-quota boxes where 'cargo install --release' blows the
+# quota at link time. After installing, runs 'cargo clean' to drop
+# the build artifacts (the binary is already copied to ~/.cargo/bin)
+# — leaves only the source clone + the installed binary behind.
+install:  ## debug build + copy to $(INSTALL_BIN) + cargo clean
+	$(CARGO) build --locked
+	install -d $(CARGO_HOME)/bin
+	install -m 0755 target/debug/$(BIN) $(INSTALL_BIN)
+	$(CARGO) clean
+	@echo "$(BIN) installed to $(INSTALL_BIN) (debug build)"
+
+# Opt-in release install. ~600 MiB peak disk; build artifacts kept
+# after install for incremental rebuilds. Pass PROFILE=release or
+# use the install-release target.
+install-release:  ## release build via 'cargo install --path . --locked'
 	$(CARGO) install --path . --locked
 
 run:  ## cargo run -- <args>  (pass CLI args after --)

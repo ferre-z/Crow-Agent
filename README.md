@@ -12,7 +12,9 @@ Install (one line):
 curl -sSf https://raw.githubusercontent.com/ferre-z/Crow-Agent/main/scripts/install.sh | sh
 ```
 
-The installer clones the repo, builds a release binary, and drops `crow` into `~/.cargo/bin/crow`. **It auto-installs any missing dependencies** — Rust via rustup, basic build tools via your system package manager — so it works on a clean box with no prior setup. Linux and macOS only (Windows is blocked upstream by the `nix` crate; pass `--no-bootstrap` to opt out).
+The installer clones the repo, builds a **debug** binary (small disk footprint, fits on disk-quota boxes), copies it into `~/.cargo/bin/crow`, then `cargo clean`s the build artifacts so the only thing left behind is the source clone and the installed binary. To get an optimised release build, pass `--release`.
+
+**It auto-installs any missing dependencies** — Rust via rustup, basic build tools via your system package manager — so it works on a clean box with no prior setup. Linux and macOS only (Windows is blocked upstream by the `nix` crate; pass `--no-bootstrap` to opt out).
 
 Test from a fresh clone (one line):
 
@@ -29,7 +31,7 @@ crow --version
 crow doctor
 ```
 
-Other useful targets: `make build`, `make lint`, `make install`, `make smoke`, `make ci`. Run `make help` for the full list.
+Other useful targets: `make build`, `make install-release`, `make lint`, `make smoke`, `make ci`. Run `make help` for the full list.
 
 ## Status
 

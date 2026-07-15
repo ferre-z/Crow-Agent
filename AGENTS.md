@@ -15,7 +15,8 @@ A Makefile wraps the standard cargo invocations so a single `make <target>` runs
 - `make build` — release build into `target/release/crow`
 - `make lint` — clippy with `-D warnings`
 - `make fmt` / `make fmt-check` — apply / verify rustfmt
-- `make install` — `cargo install --path . --locked` (puts `crow` in `~/.cargo/bin`)
+- `make install` — **debug** build + copy `~/.cargo/bin/crow` + `cargo clean`. Small disk footprint; the optimized equivalent is `make install-release`
+- `make install-release` — `cargo install --path . --locked` (release build, ~600 MiB peak)
 - `make smoke` — release build + `crow --version && crow doctor`
 - `make ci` — `fmt-check + lint + build + test` (mirrors `.github/workflows/ci.yml`)
 
