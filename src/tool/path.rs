@@ -101,6 +101,14 @@ pub fn safe_resolve(root: &Path, path: &Path) -> Result<PathBuf, io::Error> {
 /// in turn so symlinks are resolved before the containment check. If
 /// every existing ancestor stays under the root, re-attach the
 /// non-existing tail and return the result.
+///
+/// Important: we canonicalise the **deepest** existing prefix, not the
+/// first one. The earlier "break on first success" version had a hole
+/// when the nearest existing ancestor was the project root itself but
+/// the next existing ancestor (one level deeper) was a symlink to
+/// outside the root — that case is now caught because the deeper
+/// canonicalisation either collapses the symlink to an outside path
+/// (which `is_inside` then rejects) or fails.
 fn resolve_nearest_existing(root: &Path, joined: &Path) -> Result<PathBuf, io::Error> {
     // Algorithm: walk the joined path's components. Build a result
     // path by appending each non-`..`/`.` component to a stack.
@@ -111,10 +119,9 @@ fn resolve_nearest_existing(root: &Path, joined: &Path) -> Result<PathBuf, io::E
     // We DO NOT try to canonicalise intermediate paths (e.g.
     // "a/b/..") because that may not exist on disk. Instead, we
     // reduce the component list in memory: "a/b/../f.txt" becomes
-    // ["a", "f.txt"]. Then we attempt to canonicalise "a" (the
-    // longest canonical prefix). If that succeeds, the result is
-    // "a/f.txt". If "a" doesn't exist either, we keep walking up
-    // until we find something that does.
+    // ["a", "f.txt"]. Then we attempt to canonicalise progressively
+    // longer prefixes of the reduced list and keep the deepest one
+    // that succeeds.
     let abs = if joined.is_absolute() {
         joined.to_path_buf()
     } else {
@@ -161,18 +168,29 @@ fn resolve_nearest_existing(root: &Path, joined: &Path) -> Result<PathBuf, io::E
         }
     }
 
-    // Now find the longest canonical prefix of `reduced`. Walk
-    // the reduced list, canonicalising cumulatively. The first
-    // canonicalisation that succeeds gives us the prefix. The
-    // remaining components are the tail.
+    // Walk the reduced list from shortest to longest, canonicalising
+    // cumulatively. Keep the DEEPEST successful canonicalisation —
+    // not the first. Canonicalisation is monotonic (deeper canonical
+    // forms are prefixes of shallower ones), so this gives us the
+    // longest existing canonical prefix of the input. Any symlink
+    // along the way is collapsed into the prefix, exposing escapes
+    // to the caller's `is_inside` check.
     let mut prefix_idx = 0;
     let mut prefix_canon: Option<PathBuf> = None;
     for i in 1..=reduced.len() {
         let candidate: PathBuf = reduced[..i].iter().collect();
-        if let Ok(c) = fs::canonicalize(&candidate) {
-            prefix_canon = Some(c);
-            prefix_idx = i;
-            break;
+        match fs::canonicalize(&candidate) {
+            Ok(c) => {
+                prefix_canon = Some(c);
+                prefix_idx = i;
+                // No break — keep walking to find a deeper prefix.
+            }
+            Err(_) => {
+                // First canonicalisation failure ends the prefix
+                // search: the prefix that succeeded at i-1 is the
+                // longest that exists on disk.
+                break;
+            }
         }
     }
     let prefix = prefix_canon.ok_or_else(|| {
@@ -387,6 +405,31 @@ mod tests {
         // root/../escape attempts to step out of root.
         let err = safe_resolve(root, Path::new("../escape")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nonexistent_target_under_symlinked_parent_is_rejected() {
+        // Regression: a path like `project/link/new-file` where
+        // `link` is a symlink to outside the root and `new-file`
+        // does not exist. The deepest existing canonical prefix
+        // is the symlink target (outside root), so the final
+        // containment check must reject this.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let outside = Path::new("/etc");
+        if !outside.exists() {
+            return;
+        }
+        let link = root.join("link");
+        symlink(outside, &link).unwrap();
+        // `link/new-file` does not exist; `link` resolves to /etc.
+        let err = safe_resolve(root, Path::new("link/new-file")).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidInput,
+            "expected symlink escape to be rejected, got: {err}"
+        );
     }
 
     #[test]
