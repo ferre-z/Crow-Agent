@@ -131,6 +131,59 @@ pub fn compile(project_root: &Path, cwd: &Path) -> Result<CompiledContext, Conte
     })
 }
 
+impl CompiledContext {
+    /// Serialize this context into a single string suitable for the
+    /// model's `system` field. Format:
+    ///
+    /// ```text
+    /// <system_prompt>
+    ///
+    /// # Repository instructions
+    ///
+    /// ## <relative path of AGENTS.md #1>
+    ///
+    /// <contents>
+    ///
+    /// ## <relative path of AGENTS.md #2>
+    ///
+    /// <contents>
+    /// ```
+    ///
+    /// Provenance is included so the model can attribute guidance to
+    /// the right level (root vs. nested). The string is empty when
+    /// there are no instructions and the embedded prompt itself is
+    /// empty (which never happens in v0 — the prompt is always
+    /// non-empty).
+    #[must_use]
+    pub fn to_request_text(&self, project_root: &Path) -> String {
+        let mut out = String::with_capacity(self.system_prompt.len() + 256);
+        out.push_str(&self.system_prompt);
+        if self.instructions.is_empty() {
+            return out;
+        }
+        out.push_str("\n\n# Repository instructions\n");
+        for inst in &self.instructions {
+            let rel = inst
+                .path
+                .strip_prefix(project_root)
+                .unwrap_or(&inst.path)
+                .display()
+                .to_string();
+            out.push_str("\n## ");
+            out.push_str(&rel);
+            out.push('\n');
+            out.push_str(&inst.content);
+            // Ensure each block ends on a newline boundary so the
+            // next `## ` header (or the end of the system field) is
+            // visually separated.
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out
+    }
+}
+
 /// Read every `AGENTS.md` on the root → cwd path, broadest first.
 ///
 /// Exposed for callers that want the raw instruction list without
@@ -452,6 +505,35 @@ mod tests {
         let dir = with_tree(|_| {});
         let ctx = compile(dir.path(), dir.path()).expect("compile");
         assert_eq!(ctx.system_prompt, SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn to_request_text_with_no_instructions_returns_prompt_only() {
+        let dir = with_tree(|_| {});
+        let ctx = compile(dir.path(), dir.path()).expect("compile");
+        let text = ctx.to_request_text(dir.path());
+        assert_eq!(text, ctx.system_prompt);
+    }
+
+    #[test]
+    fn to_request_text_concatenates_prompt_and_instructions() {
+        // The gate for phase 1: the live model request must contain
+        // both the embedded prompt and every discovered AGENTS.md
+        // body, with provenance headers.
+        let dir = with_tree(|root| {
+            write(&root.join("AGENTS.md"), "root rule\n");
+            write(&root.join("src/AGENTS.md"), "nested rule\n");
+        });
+        let cwd = dir.path().join("src");
+        let ctx = compile(dir.path(), &cwd).expect("compile");
+        let text = ctx.to_request_text(dir.path());
+
+        assert!(text.starts_with(&ctx.system_prompt));
+        assert!(text.contains("# Repository instructions"));
+        assert!(text.contains("## AGENTS.md"));
+        assert!(text.contains("root rule"));
+        assert!(text.contains("## src/AGENTS.md"));
+        assert!(text.contains("nested rule"));
     }
 
     #[test]

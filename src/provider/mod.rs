@@ -39,7 +39,9 @@ pub use self::stream::{ProviderChunk, StreamAccumulator, StreamError};
 /// `messages` is the full conversation history in order, including any
 /// tool results from prior turns. `tools_schema` is a JSON Schema (or
 /// whatever the provider needs) describing the tools the model is
-/// allowed to call.
+/// allowed to call. `system` carries the compiled prompt (embedded
+/// system prompt + discovered `AGENTS.md` content) that should be
+/// injected as the model's system message for this turn.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelRequest {
     /// Conversation history, oldest first.
@@ -48,10 +50,16 @@ pub struct ModelRequest {
     /// model. We pass it through as opaque JSON so the agent loop can
     /// stay provider-neutral.
     pub tools_schema: serde_json::Value,
+    /// Compiled system prompt for this turn. Empty string means "the
+    /// provider should fall back to its own default". The agent loop
+    /// populates this from [`crate::context::CompiledContext`] every
+    /// turn so changes to repository `AGENTS.md` content take effect
+    /// without restarting the run.
+    pub system: String,
 }
 
 /// Errors a provider can surface to the agent loop.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ProviderError {
     /// The provider returned malformed or contradictory data (bad
     /// JSONL, missing fields, an unknown event type, etc.).

@@ -30,8 +30,16 @@
 //! them. Streaming chunks may use `try_send` and drop on backpressure;
 //! the consumer counts drops and emits a summary.
 
+pub mod bash;
+pub mod edit;
 pub mod path;
 pub mod read;
+pub mod write;
+
+pub use bash::BashTool;
+pub use edit::EditTool;
+pub use read::ReadTool;
+pub use write::WriteTool;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,11 +48,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use schemars::schema::Schema;
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::event::{AgentEvent, ErrorCode};
+use crate::event::{AgentEvent, ErrorCode, ToolOutcome as EventToolOutcome};
 use crate::ids::ToolCallId;
 
 /// Per-invocation context handed to a [`Tool`] when it runs.
@@ -196,31 +205,66 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
-    /// Names of every registered tool. Order is hash-map iteration
-    /// order; not stable across runs.
+    /// Names of every registered tool. Returned in lexicographic order
+    /// so the model sees a stable tool list across turns and runs
+    /// (deterministic schema payload, deterministic tool call logging).
     #[must_use]
     pub fn names(&self) -> Vec<&'static str> {
-        self.tools.keys().copied().collect()
+        let mut names: Vec<&'static str> = self.tools.keys().copied().collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Tool descriptors (name + description + schema) for every
+    /// registered tool, in lexicographic name order. This is the shape
+    /// the [`genai`] adapter consumes: each entry becomes a
+    /// `genai::chat::Tool` declaration on the chat request.
+    #[must_use]
+    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+        let mut entries: Vec<(&'static str, &Arc<dyn Tool>)> =
+            self.tools.iter().map(|(n, t)| (*n, t)).collect();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        entries
+            .into_iter()
+            .map(|(name, tool)| ToolSpec {
+                name,
+                description: tool.description(),
+                schema: serde_json::to_value(tool.schema()).unwrap_or(Value::Null),
+            })
+            .collect()
     }
 
     /// Render every tool's schema into a JSON object keyed by tool
-    /// name. This is the payload sent to the model so it can generate
-    /// arguments. If a schema somehow fails to serialise (it never
-    /// should — `schemars` schemas are pure data) we emit `null` for
-    /// that entry rather than panicking.
+    /// name, in lexicographic name order. This is the payload sent to
+    /// the model so it can generate arguments. If a schema somehow
+    /// fails to serialise (it never should — `schemars` schemas are
+    /// pure data) we emit `null` for that entry rather than panicking.
     #[must_use]
     pub fn schemas_json(&self) -> Value {
+        let mut specs = self.tool_specs();
+        // Already sorted by tool_specs; the BTreeMap insert below
+        // preserves nothing because we use serde_json::Map, but the
+        // explicit sort above keeps the contract honest.
+        specs.sort_by(|a, b| a.name.cmp(b.name));
         let mut map = serde_json::Map::new();
-        for (name, tool) in &self.tools {
-            let schema = tool.schema();
-            // Safe: Schema is a serde-friendly newtype around Value.
-            // If serialisation ever fails we surface `null` so the
-            // model can still see the rest of the tools.
-            let value = serde_json::to_value(&schema).unwrap_or(Value::Null);
-            map.insert((*name).to_string(), value);
+        for spec in specs {
+            map.insert(spec.name.to_string(), spec.schema);
         }
         Value::Object(map)
     }
+}
+
+/// One tool's name + description + JSON Schema, as the registry hands
+/// them to the provider adapter. `description` is included so the
+/// adapter does not have to thread the [`Tool`] trait through.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolSpec {
+    /// Stable name (`"read"`, `"write"`, ...).
+    pub name: &'static str,
+    /// Human-readable description for the model.
+    pub description: &'static str,
+    /// JSON Schema for the tool's `args`.
+    pub schema: Value,
 }
 
 /// Validate `args` against the JSON Schema produced by `schemars`.
@@ -303,7 +347,7 @@ pub async fn execute_tool_call(
     }
 
     // Step 4: execute.
-    match tool
+    let outcome = match tool
         .execute(call.args.clone(), ctx, events.clone(), cancel)
         .await
     {
@@ -313,7 +357,35 @@ pub async fn execute_tool_call(
             message: err.to_string(),
             truncated: false,
         },
-    }
+    };
+
+    // Step 5: emit the terminal `ToolFinished` event on the same sink
+    // so consumers see the outcome paired with the call. We map our
+    // internal `ToolOutcome` to the event-layer variant by hand to
+    // avoid an accidental type drift if one of them is refactored.
+    let event_outcome = match &outcome {
+        ToolOutcome::Success { output, truncated } => EventToolOutcome::Success {
+            output: output.clone(),
+            truncated: *truncated,
+        },
+        ToolOutcome::Error {
+            code,
+            message,
+            truncated,
+        } => EventToolOutcome::Error {
+            code: code.clone(),
+            message: message.clone(),
+            truncated: *truncated,
+        },
+    };
+    let _ = events
+        .send(AgentEvent::ToolFinished {
+            call_id: call.call_id,
+            result: event_outcome,
+        })
+        .await;
+
+    outcome
 }
 
 #[cfg(test)]
@@ -492,13 +564,13 @@ mod tests {
 
     #[test]
     fn names_lists_every_registered_tool() {
+        // `names()` returns alphabetically sorted entries by contract;
+        // registration order is irrelevant.
         let mut reg = ToolRegistry::new();
         reg.register(EchoTool);
         reg.register(BoomTool);
         reg.register(CountTool);
-        let mut names = reg.names();
-        names.sort_unstable();
-        assert_eq!(names, vec!["boom", "count", "echo"]);
+        assert_eq!(reg.names(), vec!["boom", "count", "echo"]);
     }
 
     #[test]
@@ -649,12 +721,11 @@ mod tests {
 
     #[tokio::test]
     async fn wrapper_emits_tool_finished_after_tool_returns() {
-        // The wrapper does NOT emit ToolFinished itself — that is the
-        // tool's responsibility (so the tool can include chunked
-        // output). What we *can* assert is that, after the call
-        // returns, the channel carries no more events than the tool
-        // sent (the wrapper only sends ToolStarted). For EchoTool,
-        // that's exactly one event: ToolStarted.
+        // The wrapper now publishes the terminal `ToolFinished` event
+        // itself, so consumers always see the outcome paired with the
+        // call (matching the durable `SessionEntry::ToolFinished`
+        // shape). For EchoTool, the event sequence is: ToolStarted,
+        // then ToolFinished with the Success outcome.
         let mut reg = ToolRegistry::new();
         reg.register(EchoTool);
         let (tx, mut rx) = events();
@@ -666,11 +737,49 @@ mod tests {
             CancellationToken::new(),
         )
         .await;
-        // Drain; should be exactly one event (ToolStarted). If the
-        // wrapper sent more, they'd be in the channel.
         let evt = rx.recv().await.expect("event");
         assert!(matches!(evt, AgentEvent::ToolStarted { .. }));
+        let evt = rx.recv().await.expect("event");
+        match evt {
+            AgentEvent::ToolFinished { result, .. } => match result {
+                EventToolOutcome::Success { output, truncated } => {
+                    assert_eq!(output, "ok");
+                    assert!(!truncated);
+                }
+                other => panic!("expected Success, got {other:?}"),
+            },
+            other => panic!("expected ToolFinished, got {other:?}"),
+        }
         assert!(rx.try_recv().is_err(), "no extra events expected");
+    }
+
+    #[test]
+    fn schemas_json_is_lexicographically_ordered() {
+        // Determinism gate: the live model sees the same tool order on
+        // every turn. We register three tools out of order and assert
+        // the JSON output is alphabetical.
+        let mut reg = ToolRegistry::new();
+        reg.register(CountTool); // "count"
+        reg.register(EchoTool); // "echo"
+        reg.register(BoomTool); // "boom"
+        let value = reg.schemas_json();
+        let obj = value.as_object().expect("object");
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        let original: Vec<&String> = obj.keys().collect();
+        assert_eq!(original, keys, "tool schemas must be in sorted order");
+    }
+
+    #[test]
+    fn tool_specs_include_description() {
+        // The provider adapter needs the description alongside the
+        // schema so it can build a `genai::chat::Tool` declaration.
+        let mut reg = ToolRegistry::new();
+        reg.register(EchoTool);
+        let specs = reg.tool_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "echo");
+        assert!(specs[0].description.contains("Echoes"));
     }
 
     #[test]

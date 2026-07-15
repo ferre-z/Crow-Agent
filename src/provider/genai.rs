@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatStreamEvent, ContentPart, MessageContent,
+    ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatStreamEvent, MessageContent, Tool,
+    ToolCall as GenaiToolCall, ToolResponse,
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
@@ -9,7 +10,7 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::event::{StopReason, Usage};
-use crate::ids::{new_id, ToolCallId};
+use crate::ids::new_id;
 use crate::message::{Message, Part, Role};
 use crate::provider::{ModelRequest, Provider, ProviderError, ProviderStream};
 use crate::provider::{ProviderChunk, StreamAccumulator};
@@ -74,7 +75,18 @@ impl Provider for GenaiProvider {
             return Err(ProviderError::Cancelled);
         }
 
-        let chat_req = ChatRequest::new(req.messages.iter().map(message_to_chat).collect());
+        // System prompt first. Empty string is allowed (genai drops
+        // empty system messages on adapters that don't support them).
+        let mut chat_req = ChatRequest::new(req.messages.iter().map(message_to_chat).collect());
+        if !req.system.is_empty() {
+            chat_req = chat_req.with_system(req.system.clone());
+        }
+        // Tool declarations: each entry from the registry becomes a
+        // `genai::chat::Tool` with name, description, and JSON Schema.
+        let tool_specs = tools_from_schema(&req.tools_schema);
+        if !tool_specs.is_empty() {
+            chat_req = chat_req.with_tools(tool_specs);
+        }
         let options = ChatOptions::default()
             .with_capture_tool_calls(true)
             .with_capture_usage(true)
@@ -154,21 +166,160 @@ impl Provider for GenaiProvider {
     }
 }
 
-fn message_to_chat(message: &Message) -> ChatMessage {
-    let role = match message.role {
-        Role::User => ChatRole::User,
-        Role::Assistant => ChatRole::Assistant,
-        Role::ToolResult => ChatRole::Tool,
-    };
-    let parts = message
-        .parts
-        .iter()
-        .filter_map(|part| match part {
-            Part::Text { text } => Some(ContentPart::Text(text.clone())),
-            Part::Reasoning { .. } | Part::ToolCall { .. } | Part::ToolResult { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    ChatMessage::new(role, MessageContent::from(parts))
+/// Translate our provider-neutral `tools_schema` (a JSON object keyed
+/// by tool name) into the `genai` `Tool` declarations. Description is
+/// pulled from the spec field when present; otherwise we fall back to
+/// the name as a placeholder.
+///
+/// The schema shape we expect is one produced by
+/// [`crate::tool::ToolRegistry::tool_specs`] (a list of `{name,
+/// description, schema}`). For backwards compatibility we also accept
+/// the legacy object-of-schemas format (no description); we treat the
+/// description as empty in that case.
+///
+/// Exposed for integration tests in `tests/genai_request_shape.rs`.
+pub fn tools_from_schema(schema: &serde_json::Value) -> Vec<Tool> {
+    let mut out = Vec::new();
+    // Preferred shape: array of ToolSpec.
+    if let Some(arr) = schema.as_array() {
+        for spec in arr {
+            let name = spec.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let description = spec
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let parameters = spec
+                .get("schema")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let mut tool = Tool::new(name.to_owned());
+            if !description.is_empty() {
+                tool = tool.with_description(description.to_owned());
+            }
+            tool = tool.with_schema(parameters);
+            out.push(tool);
+        }
+        return out;
+    }
+    // Legacy fallback: object keyed by tool name. No description
+    // available, so we just pass the schema.
+    if let Some(obj) = schema.as_object() {
+        for (name, parameters) in obj {
+            let mut tool = Tool::new(name.clone());
+            tool = tool.with_schema(parameters.clone());
+            out.push(tool);
+        }
+    }
+    out
+}
+
+/// Translate one Crow [`Message`] into a `genai` [`ChatMessage`].
+///
+/// Roles map 1:1 except `ToolResult` which is `ChatRole::Tool` with a
+/// tool-response content body. Assistant messages may contain
+/// `Part::ToolCall`; we collect those and emit a tool_calls-only
+/// `ChatMessage` (genai does not accept mixed text + tool_calls
+/// reliably across adapters, so we prefer tool_calls when present).
+///
+/// Exposed for integration tests in `tests/genai_request_shape.rs`.
+pub fn message_to_chat(message: &Message) -> ChatMessage {
+    match message.role {
+        Role::User => {
+            // User messages may carry text or image content. v0 only
+            // emits text, but we tolerate either.
+            let parts: Vec<genai::chat::ContentPart> = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text { text } => Some(genai::chat::ContentPart::Text(text.clone())),
+                    _ => None,
+                })
+                .collect();
+            ChatMessage::new(ChatRole::User, MessageContent::from_parts(parts))
+        }
+        Role::Assistant => {
+            // Distinguish three shapes:
+            //  - tool calls only (preferred for tool_use) -> ChatRole::Assistant with tool_calls
+            //  - reasoning only -> ChatRole::Assistant with reasoning attached
+            //  - text only -> ChatRole::Assistant with text parts
+            // Mixed text + tool_calls is dropped to text-only (matches
+            // the prior behaviour); the genai stream will see the
+            // tool_calls via captured_tool_calls on the next turn.
+            let tool_calls: Vec<GenaiToolCall> = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::ToolCall { id, name, args } => Some(GenaiToolCall {
+                        call_id: id.0.to_string(),
+                        fn_name: name.clone(),
+                        fn_arguments: args.clone(),
+                        thought_signatures: None,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            if !tool_calls.is_empty() {
+                return ChatMessage::new(
+                    ChatRole::Assistant,
+                    MessageContent::from_tool_calls(tool_calls),
+                );
+            }
+            let reasoning = message.parts.iter().find_map(|part| match part {
+                Part::Reasoning { text } => Some(text.clone()),
+                _ => None,
+            });
+            let parts: Vec<genai::chat::ContentPart> = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text { text } => Some(genai::chat::ContentPart::Text(text.clone())),
+                    _ => None,
+                })
+                .collect();
+            let msg = ChatMessage::new(ChatRole::Assistant, MessageContent::from_parts(parts));
+            if let Some(thought) = reasoning {
+                msg.with_reasoning_content(Some(thought))
+            } else {
+                msg
+            }
+        }
+        Role::ToolResult => {
+            // Each ToolResult part becomes a ToolResponse. Multiple
+            // tool results in one message are uncommon but supported.
+            let responses: Vec<ToolResponse> = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::ToolResult {
+                        call_id,
+                        output,
+                        is_error,
+                        ..
+                    } => {
+                        let prefix = if *is_error { "ERROR: " } else { "" };
+                        Some(ToolResponse::new(
+                            call_id.0.to_string(),
+                            format!("{prefix}{output}"),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if responses.is_empty() {
+                // Should not happen in practice; fall back to an
+                // empty tool message so we don't drop the entry.
+                ChatMessage::new(ChatRole::Tool, MessageContent::from_text(""))
+            } else {
+                ChatMessage::new(
+                    ChatRole::Tool,
+                    MessageContent::from_tool_responses(responses),
+                )
+            }
+        }
+    }
 }
 
 fn event_to_chunks(event: ChatStreamEvent) -> Vec<ProviderChunk> {
@@ -182,7 +333,12 @@ fn event_to_chunks(event: ChatStreamEvent) -> Vec<ProviderChunk> {
         }],
         ChatStreamEvent::ThoughtSignatureChunk(_) => Vec::new(),
         ChatStreamEvent::ToolCallChunk(chunk) => {
-            let call_id = ToolCallId(new_id());
+            // Prefer the upstream call_id when provided; fall back to
+            // a fresh ULID. The accumulator keys tool calls by
+            // `ToolCallId`, so this round-trips through history.
+            let call_id = crate::ids::ToolCallId(
+                ulid::Ulid::from_string(&chunk.tool_call.call_id).unwrap_or_else(|_| new_id()),
+            );
             vec![
                 ProviderChunk::ToolCallStart {
                     call_id,
@@ -384,6 +540,7 @@ mod tests {
                 ModelRequest {
                     messages: Vec::new(),
                     tools_schema: serde_json::Value::Null,
+                    system: String::new(),
                 },
                 cancel,
             )
