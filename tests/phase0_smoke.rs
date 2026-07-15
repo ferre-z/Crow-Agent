@@ -197,6 +197,7 @@ async fn phase0_smoke() -> Result<(), Box<dyn Error>> {
     let request = crow::provider::ModelRequest {
         messages: vec![],
         tools_schema: serde_json::json!({}),
+        system: String::new(),
     };
     // Touch the stream API to prove it constructs and returns events.
     let _stream = provider.stream(request, CancellationToken::new()).await?;

@@ -1,12 +1,12 @@
 # Phase 2 (Desktop App) — Post-Mortem and Handover
 
-> This is the post-mortem + handover for **Phase 2** of Crow. Phase 1 (kernel, waves 1-3) is done; phase 2 (desktop app) is the next 4 waves. Written before any code lands, so it captures the *plan* and the *expected lessons* — not the actual ones.
+> Status note: this doc was written before Phase 1 (kernel, waves 1-3) actually landed. Wave 1, Wave 2 (tasks 2.1–2.9), and Wave 3 (mutation + recovery) are now merged on `main`. Phase 2 (desktop app, waves 4–7) is the next 4 waves; none of its code has shipped yet. The plan below is the live plan; the lessons-learned section at the bottom is from Phase 1 and still applies.
 
 ## What's in this folder
 
-- `00-master-plan-phase-2.md` — the master plan. Read this first.
-- `waves/` — the wave briefs for desktop waves 4, 5, 6, 7.
-- `tasks/` — the per-task briefs (24 tasks total across 4 waves).
+- `00-master-plan.md` — the master plan for Phase 2. Read this first.
+- `waves/` — wave briefs for desktop waves 4, 5, 6, 7.
+- `briefs/wave-4/` … `briefs/wave-7/` — per-task briefs (27 tasks total across 4 waves; not 24 — the earlier count in this doc was off).
 - `decisions/` — new decision logs as we go.
 
 ## Phase 2 wave map (refreshed)
@@ -17,6 +17,12 @@
 | 5 | Tauri shell + web frontend | 5.1–5.8 | mostly sequential; 5.1 → 5.2 → 5.3 → 5.4 → 5.5 → 5.6 → 5.7 → 5.8 (some can be parallel) | ~300K tokens, 8-12h |
 | 6 | Approvals UX + keyring + images | 6.1–6.5 | sequential; 6.1 → 6.2 → 6.3 → 6.4 → 6.5 | ~150K tokens, 5-8h |
 | 7 | Plan mode + activity pane + notifications | 7.1–7.7 | sequential; 7.1 → 7.2 → 7.3 → 7.4 → 7.5 → 7.6 → 7.7 | ~200K tokens, 6-10h |
+
+## Frontend direction
+
+**Tauri 2 desktop** (not Ratatui TUI). Earlier README and this folder
+referenced Ratatui; those references are stale. The Tauri shell is
+wave 5; everything builds on the app-server from wave 4.
 
 ## Routing
 
@@ -42,11 +48,12 @@
 ## Handover to next session
 
 When Ferre returns to test:
-1. Run the wave 1+2 (kernel) test suite to confirm the base still works.
-2. Read the wave 4 master plan (`docs/waves/00-master-plan-phase-2.md`).
-3. Read the wave 4 task briefs (`docs/briefs/wave-4/`).
-4. Dispatch wave 4 round A (task 4.1 — app-server skeleton). The app-server is the foundation; everything else builds on it.
-5. If 4.1 lands clean, dispatch round B (4.2 — request handlers). Wave 4's other tasks are mostly sequential.
+1. Run the kernel test suite (`cargo test --all-targets --all-features`) to confirm waves 1-3 still work.
+2. Smoke-test the CLI: `cargo run -- doctor`, `cargo run -- sessions`, `cargo run -- exec "..."`.
+3. Read `docs/waves/00-master-plan.md`.
+4. Read the wave 4 task briefs (`docs/briefs/wave-4/`).
+5. Dispatch wave 4 round A (task 4.1 — app-server skeleton). The app-server is the foundation; everything else builds on it.
+6. If 4.1 lands clean, dispatch round B (4.2 — request handlers). Wave 4's other tasks are mostly sequential.
 
 ## Open questions for Ferre
 
@@ -67,3 +74,8 @@ The headline:
 - Run the quality gate yourself after every implementer.
 - Reviewers (spec + quality) catch issues the implementer misses.
 - Worktrees branch from main AFTER previous task's merge, not in parallel.
+- The kernel is *the* foundation — without the live provider path
+  actually transmitting the system prompt, AGENTS.md content, tool
+  schemas, and tool calls/results, no client (CLI/TUI/desktop) can
+  work. Phase 1 closed this gap; don't skip it.
+
