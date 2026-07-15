@@ -231,6 +231,7 @@ mod tests {
         ModelRequest {
             messages: Vec::new(),
             tools_schema: serde_json::Value::Null,
+            system: String::new(),
         }
     }
 

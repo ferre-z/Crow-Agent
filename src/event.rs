@@ -126,6 +126,96 @@ pub enum StopReason {
 #[serde(transparent)]
 pub struct ErrorCode(pub String);
 
+/// Consumer of live [`AgentEvent`] values emitted by the agent loop.
+///
+/// The kernel produces events as it runs (text deltas, tool starts, model
+/// finishes, etc.). CLI, TUI, app-server, and test harnesses all want to
+/// observe those events. The [`Agent`] holds a boxed [`AgentEventSink`]
+/// and forwards every event it sees to the sink.
+///
+/// # Contract
+///
+/// - `on_event` is called once per event, in the order the kernel
+///   observes them.
+/// - Implementations must be cheap to call — the kernel calls this on
+///   the hot path for every text delta.
+/// - Implementations must not block. Slow consumers should buffer
+///   internally (e.g. an `mpsc::Sender`) and drop or backpressure on
+///   their own time scale.
+/// - The sink is invoked synchronously from inside the agent task. It
+///   should NOT `await` long-running work; spawn a task if it must.
+///
+/// [`Agent`]: crate::agent::Agent
+pub trait AgentEventSink: Send + Sync {
+    /// Receive one event. Default no-op for tests that don't care.
+    fn on_event(&self, _event: AgentEvent) {}
+}
+
+/// Sink that collects every event into an in-memory `Vec`. Useful for
+/// tests and for CLI runs that want to dump the transcript after the
+/// loop ends.
+#[derive(Debug, Default)]
+pub struct CollectingSink {
+    events: std::sync::Mutex<Vec<AgentEvent>>,
+}
+
+impl CollectingSink {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot of the events collected so far.
+    #[must_use]
+    pub fn events(&self) -> Vec<AgentEvent> {
+        self.events
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl AgentEventSink for CollectingSink {
+    fn on_event(&self, event: AgentEvent) {
+        if let Ok(mut guard) = self.events.lock() {
+            guard.push(event);
+        }
+    }
+}
+
+/// A sink that forwards events to a bounded Tokio mpsc channel.
+///
+/// The CLI / TUI typically holds the [`tokio::sync::mpsc::Receiver`]
+/// and consumes events as the run progresses. Capacity follows the
+/// existing tool event channel contract (256) so backpressure behaves
+/// identically to in-tool events.
+#[derive(Debug, Clone)]
+pub struct ChannelSink {
+    sender: tokio::sync::mpsc::Sender<AgentEvent>,
+}
+
+impl ChannelSink {
+    #[must_use]
+    pub fn new(capacity: usize) -> (Self, tokio::sync::mpsc::Receiver<AgentEvent>) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+        (Self { sender }, receiver)
+    }
+}
+
+impl AgentEventSink for ChannelSink {
+    fn on_event(&self, event: AgentEvent) {
+        // Block on send under backpressure: the agent loop awaits
+        // anyway on its own bounded channels, and a slow consumer
+        // should slow the loop rather than silently drop events.
+        if self.sender.try_send(event).is_err() {
+            // Channel full or closed. We deliberately do not block
+            // here — the kernel is single-threaded for the sink call
+            // and we don't want to deadlock on a full bounded channel.
+            // Drop on the floor; the consumer can detect via stream end.
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -85,6 +85,25 @@ pub enum SessionEntry {
         /// Wall-clock time the interruption was recorded.
         timestamp: Timestamp,
     },
+    /// The run terminated with a structured failure.
+    ///
+    /// Distinct from [`SessionEntry::RunInterrupted`] (cooperative
+    /// cancellation / kill) and [`SessionEntry::RunFinished`] (clean
+    /// success). Recorded whenever the agent loop gives up due to a
+    /// provider error, a context-limit hit, or a typed error from the
+    /// policy layer.
+    RunFailed {
+        /// Stable, machine-readable error code (see
+        /// [`crate::event::ErrorCode`]).
+        code: crate::event::ErrorCode,
+        /// Whether the failure is expected to be transient (the
+        /// supervisor may retry the same request).
+        retryable: bool,
+        /// Human-readable failure message.
+        message: String,
+        /// Wall-clock time the failure was recorded.
+        timestamp: Timestamp,
+    },
 }
 
 #[cfg(test)]
@@ -197,6 +216,19 @@ mod tests {
     }
 
     #[test]
+    fn run_failed_round_trips() {
+        let entry = SessionEntry::RunFailed {
+            code: crate::event::ErrorCode("provider_error".into()),
+            retryable: false,
+            message: "stream invalid: malformed JSON".into(),
+            timestamp: Timestamp::now(),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let back: SessionEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(entry, back);
+    }
+
+    #[test]
     fn event_ordering_invariant_holds() {
         // Spec §10: a well-formed JSONL log interleaves SessionStarted,
         // messages, and tool records in a single monotonic timeline.
@@ -256,6 +288,7 @@ mod tests {
             SessionEntry::ToolFinished { timestamp, .. } => *timestamp,
             SessionEntry::RunFinished { timestamp, .. } => *timestamp,
             SessionEntry::RunInterrupted { timestamp, .. } => *timestamp,
+            SessionEntry::RunFailed { timestamp, .. } => *timestamp,
         }
     }
 }
