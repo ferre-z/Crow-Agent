@@ -10,10 +10,19 @@
 #   --path <DIR>      : use DIR as the working directory (default $TMPDIR/crow-install-$$)
 #   --branch <REF>    : git ref to clone (default: main)
 #   --repo <URL>      : git URL (default: https://github.com/ferre-z/Crow-Agent.git)
-#   --no-path-hint    : skip the PATH reminder
+#   --no-bootstrap    : skip auto-install of missing tools
+#   --no-path-hint    : skip the PATH export reminder
 #
-# Requires: bash, git, cargo (rustup). Linux + macOS only; Windows is
-# blocked upstream by the `nix` crate.
+# Auto-bootstraps:
+#   - Rust toolchain via rustup if `cargo` is missing. Non-interactive,
+#     no shell rc modification (uses ~/.cargo/env for this process only).
+#   - Basic build tools (git, make, curl) via the system package
+#     manager when missing. Best-effort: silently skips when
+#     passwordless sudo is unavailable; in that case the script
+#     tells the user what to install and exits with a clear message.
+#
+# Requires: bash, uname. Linux + macOS only (Windows is blocked
+# upstream by the `nix` crate).
 
 set -euo pipefail
 
@@ -25,7 +34,9 @@ branch="$BRANCH_DEFAULT"
 mode="install"
 workdir=""
 print_path_hint=1
+bootstrap=1
 bin_name="crow"
+rust_toolchain="1.88"
 
 usage() {
   cat <<'EOF'
@@ -40,8 +51,13 @@ Options:
   --path DIR       working directory (default $TMPDIR/crow-install-$$)
   --branch REF     git ref (default: main)
   --repo URL       git URL (default: ferre-z/Crow-Agent)
+  --no-bootstrap   don't auto-install missing tools
   --no-path-hint   don't print the PATH export reminder
   -h, --help       show this help
+
+The script auto-installs Rust (via rustup) and basic build tools (via the
+system package manager) when missing, so the one-liner works on a clean
+machine. Pass --no-bootstrap to opt out and require pre-installed tools.
 
 Examples:
   # Install (default):
@@ -52,6 +68,9 @@ Examples:
 
   # Install a specific branch into a custom dir:
   curl -sSf .../install.sh | sh -s -- --branch my-feature --path /tmp/crow-dev
+
+  # Skip auto-bootstrap (require pre-installed tools):
+  curl -sSf .../install.sh | sh -s -- --no-bootstrap
 EOF
 }
 
@@ -65,6 +84,7 @@ while [ $# -gt 0 ]; do
     --branch=*)       branch="${1#*=}"; shift ;;
     --repo)           repo="${2:-}"; shift 2 || { echo "install.sh: --repo requires an argument" >&2; exit 1; } ;;
     --repo=*)         repo="${1#*=}"; shift ;;
+    --no-bootstrap)   bootstrap=0; shift ;;
     --no-path-hint)   print_path_hint=0; shift ;;
     -h|--help)        usage; exit 0 ;;
     *)                echo "install.sh: unknown argument: $1" >&2; usage >&2; exit 1 ;;
@@ -78,21 +98,165 @@ case "$uname_s" in
   *) echo "install.sh: unsupported platform '$uname_s' (Linux and macOS only)" >&2; exit 1 ;;
 esac
 
-# --- tool check --------------------------------------------------------------
-for tool in git cargo make; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "install.sh: missing required tool: $tool" >&2
-    case "$tool" in
-      cargo|make)
-        echo "  install rustup from https://rustup.rs and re-run this script." >&2
-        ;;
-      git)
-        echo "  install git (e.g. 'apt install git' on Debian/Ubuntu, 'brew install git' on macOS)." >&2
-        ;;
-    esac
+# --- helpers -----------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Run as root: empty SUDO. Passwordless sudo (sudo -n works): SUDO=sudo -n.
+# Otherwise: empty (best-effort, will silently skip installs).
+detect_sudo() {
+  if [ "$(id -u)" = "0" ]; then
+    SUDO=""
+  elif have sudo && sudo -n true 2>/dev/null; then
+    SUDO="sudo -n"
+  else
+    SUDO=""
+  fi
+  export SUDO
+}
+
+# Best-effort install via the system package manager. Skips silently
+# when there's no passwordless sudo or an unknown distro; in that case
+# the outer check at the end reports the missing tools.
+install_packages() {
+  detect_sudo
+  case "$uname_s" in
+    Darwin)
+      if ! have brew; then
+        return 0
+      fi
+      for pkg in "$@"; do
+        if have "$pkg"; then continue; fi
+        echo "install.sh: installing '$pkg' via Homebrew"
+        brew install "$pkg" >/dev/null 2>&1 || true
+      done
+      ;;
+    Linux)
+      if [ ! -f /etc/os-release ]; then
+        return 0
+      fi
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      case "${ID:-unknown}" in
+        ubuntu|debian|pop|linuxmint|elementary|kde-neon)
+          for pkg in "$@"; do
+            if have "$pkg"; then continue; fi
+            echo "install.sh: installing '$pkg' via apt-get"
+            $SUDO apt-get update -qq >/dev/null 2>&1 || true
+            $SUDO apt-get install -y "$pkg" >/dev/null 2>&1 || true
+          done
+          ;;
+        fedora|rhel|centos|rocky|almalinux|ol)
+          for pkg in "$@"; do
+            if have "$pkg"; then continue; fi
+            echo "install.sh: installing '$pkg' via dnf"
+            $SUDO dnf install -y "$pkg" >/dev/null 2>&1 || true
+          done
+          ;;
+        arch|manjaro|endeavouros)
+          for pkg in "$@"; do
+            if have "$pkg"; then continue; fi
+            echo "install.sh: installing '$pkg' via pacman"
+            $SUDO pacman -Sy --noconfirm --needed "$pkg" >/dev/null 2>&1 || true
+          done
+          ;;
+        opensuse*|sles)
+          for pkg in "$@"; do
+            if have "$pkg"; then continue; fi
+            echo "install.sh: installing '$pkg' via zypper"
+            $SUDO zypper --non-interactive install -y "$pkg" >/dev/null 2>&1 || true
+          done
+          ;;
+        alpine)
+          for pkg in "$@"; do
+            if have "$pkg"; then continue; fi
+            echo "install.sh: installing '$pkg' via apk"
+            $SUDO apk add --no-cache "$pkg" >/dev/null 2>&1 || true
+          done
+          ;;
+        *)
+          # Unknown distro — give up rather than guess a package manager.
+          ;;
+      esac
+      ;;
+  esac
+}
+
+# Install Rust via rustup. Uses curl (which we ensured above).
+install_rust() {
+  echo "install.sh: installing Rust toolchain via rustup (channel ${rust_toolchain})"
+  local url="https://sh.rustup.rs"
+  curl --proto '=https' --tlsv1.2 -sSf "$url" | \
+    sh -s -- -y \
+      --default-toolchain "$rust_toolchain" \
+      --profile minimal \
+      --no-modify-path
+  # Source the env file so cargo is on PATH for the rest of this
+  # script. The shell rc files are NOT touched (--no-modify-path).
+  # shellcheck disable=SC1091
+  . "$HOME/.cargo/env"
+  if ! have cargo; then
+    echo "install.sh: rustup install completed but cargo is still not on PATH" >&2
     exit 1
   fi
+}
+
+# --- bootstrap ---------------------------------------------------------------
+if [ "$bootstrap" = "1" ]; then
+  # Step 1: install curl first because rustup needs it.
+  install_packages curl
+  if ! have curl; then
+    echo "install.sh: 'curl' is required but could not be auto-installed." >&2
+    echo "  Install curl manually (e.g. apt install curl / brew install curl)" >&2
+    echo "  and re-run this script." >&2
+    exit 1
+  fi
+
+  # Step 2: install Rust if missing. This is the biggest win — most
+  # users won't have cargo on a fresh box.
+  if ! have cargo || ! have rustc; then
+    install_rust
+  else
+    # Cargo exists. Make sure the pinned toolchain is available; rustup
+    # auto-installs from rust-toolchain.toml when invoked.
+    if have rustup && [ -f rust-toolchain.toml ]; then
+      # No-op: rustup itself honours rust-toolchain.toml per-directory.
+      :
+    fi
+  fi
+
+  # Step 3: install git and make (and curl is now confirmed above).
+  install_packages git make
+fi
+
+# --- final tool check ---------------------------------------------------------
+missing=()
+for tool in git curl make cargo rustc; do
+  if ! have "$tool"; then
+    missing+=("$tool")
+  fi
 done
+if [ ${#missing[@]} -gt 0 ]; then
+  echo "" >&2
+  echo "install.sh: required tools still missing after bootstrap: ${missing[*]}" >&2
+  echo "" >&2
+  echo "  Install them manually, then re-run this script (or pass --no-bootstrap" >&2
+  echo "  to suppress auto-install entirely)." >&2
+  echo "" >&2
+  case "$uname_s" in
+    Linux)
+      echo "  Linux: 'sudo apt-get install git make curl' (Debian/Ubuntu)" >&2
+      echo "         'sudo dnf install git make curl'    (Fedora/RHEL)" >&2
+      echo "         'sudo pacman -S git make curl'      (Arch)" >&2
+      ;;
+    Darwin)
+      echo "  macOS: 'xcode-select --install'              (Apple toolchain + git)" >&2
+      echo "         'brew install make curl'              (or use Xcode CLT)" >&2
+      ;;
+  esac
+  echo "" >&2
+  echo "  For Rust on any platform: see https://rustup.rs" >&2
+  exit 1
+fi
 
 # --- working directory -------------------------------------------------------
 if [ -z "$workdir" ]; then
@@ -112,7 +276,6 @@ if [ ! -d "$workdir/.git" ]; then
   git clone --depth 1 --branch "$branch" "$repo" "$workdir"
 else
   echo "install.sh: reusing existing checkout at $workdir"
-  # Fast-forward to the latest of the requested ref without clobbering local edits.
   (cd "$workdir" && git fetch --depth 1 origin "$branch" && git checkout "$branch" && git reset --hard "origin/$branch") \
     || echo "install.sh: warning: could not fast-forward existing checkout; continuing with current tree"
 fi
@@ -120,16 +283,33 @@ fi
 cd "$workdir"
 
 # --- run --------------------------------------------------------------------
+run_cargo_in_step() {
+  # $1 = sub-step verb, $2.. = cargo args
+  local verb="$1"
+  shift
+  echo "install.sh: ${verb} (cargo $* )"
+  cargo "$@"
+}
+
 case "$mode" in
   test)
     echo "install.sh: running test suite"
-    make test
+    if have make; then
+      make test
+    else
+      # Defensive fallback — bootstrap should have installed make.
+      echo "install.sh: 'make' missing; falling back to direct cargo test"
+      run_cargo_in_step "test" test --all-targets --all-features
+    fi
     echo "install.sh: tests passed"
     ;;
   install)
     echo "install.sh: building and installing to $install_bin"
-    # `make install` wraps `cargo install --path . --locked`.
-    make install
+    if have make; then
+      make install
+    else
+      run_cargo_in_step "install" install --path . --locked
+    fi
     echo ""
     echo "install.sh: installed."
     if [ -x "$install_bin" ]; then

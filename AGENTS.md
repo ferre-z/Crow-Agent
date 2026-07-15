@@ -32,6 +32,11 @@ Run `make ci` (or all three cargo checks) before opening a pull request. Tests u
 ## One-line scripts
 
 - `bash scripts/install.sh` — clone, build, install to `~/.cargo/bin`.
+  **Auto-bootstraps missing dependencies**: Rust via rustup if `cargo`
+  is missing; basic build tools (`git`, `make`, `curl`) via the
+  system package manager (apt / dnf / pacman / zypper / apk / brew)
+  when missing. Linux + macOS only. Pass `--no-bootstrap` to skip
+  auto-install.
 - `bash scripts/test.sh` — wrapper around `make test`, usable from any cwd.
 
 ## Coding Style & Naming Conventions

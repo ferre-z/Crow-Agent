@@ -12,7 +12,7 @@ Install (one line):
 curl -sSf https://raw.githubusercontent.com/ferre-z/Crow-Agent/main/scripts/install.sh | sh
 ```
 
-This clones the repo, builds a release binary, installs it to `~/.cargo/bin/crow`, and prints a PATH hint if needed.
+The installer clones the repo, builds a release binary, and drops `crow` into `~/.cargo/bin/crow`. **It auto-installs any missing dependencies** — Rust via rustup, basic build tools via your system package manager — so it works on a clean box with no prior setup. Linux and macOS only (Windows is blocked upstream by the `nix` crate; pass `--no-bootstrap` to opt out).
 
 Test from a fresh clone (one line):
 
