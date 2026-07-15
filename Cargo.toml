@@ -32,6 +32,7 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tempfile = "3"
+anyhow = "1"
 # Wave 2 additions:
 genai = "=0.6.5"
 schemars = "0.8"
@@ -42,8 +43,13 @@ sha2 = "0.10"
 # Wave 3 additions:
 secrecy = "0.8"
 nix = { version = "0.27", features = ["signal", "process"] }
+# Phase 4 additions:
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+dirs = "5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 assert_cmd = "2"
 predicates = "3"
+filetime = "0.2"

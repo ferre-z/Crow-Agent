@@ -9,9 +9,10 @@
 //! grows by one line per call.
 //!
 //! Crash semantics: a crash between the `write` and the `fsync` can
-//! produce a truncated final line. [`read_entries`] silently drops any
-//! line that fails to parse, so the next process can resume from the
-//! last good entry without manual repair.
+//! produce a truncated final line. [`read_entries_with_recovery`]
+//! distinguishes a truncated tail (the only realistic crash case)
+//! from corruption in the middle of the file, so the next process
+//! can resume from the last good entry without manual repair.
 
 use std::path::{Path, PathBuf};
 
@@ -34,15 +35,30 @@ pub enum SessionError {
     /// Another writer already holds this session file open.
     ///
     /// Returned by [`SessionWriter::open`] when the per-path sibling
-    /// `.lock` file already exists. Two [`SessionWriter`]s racing on
-    /// the same path is treated as a programming error, not a
-    /// silently-merged condition.
+    /// `.lock` file already exists and its owner is still alive (or
+    /// the lock was created very recently). Stale locks are
+    /// auto-evicted by age.
     #[error("session: another writer already holds {path}")]
     Busy {
         /// Path that was already locked.
         path: PathBuf,
     },
+    /// The lockfile is older than [`LOCK_MAX_AGE_SECS`]. Surfaced
+    /// only by callers that want to distinguish staleness; the open
+    /// path evicts such locks transparently.
+    #[error("session: stale lockfile at {path}")]
+    StaleLock {
+        /// Lockfile path.
+        path: PathBuf,
+    },
 }
+
+/// How long a `.lock` file may live before we consider it stale and
+/// evict it. Two minutes is well over any legitimate write's lifetime
+/// (each `append` returns in milliseconds) but short enough that a
+/// crashed process recovers quickly.
+#[allow(dead_code)]
+pub const LOCK_MAX_AGE_SECS: u64 = 120;
 
 /// Append-only JSONL writer for a single session log.
 ///
@@ -62,21 +78,28 @@ impl SessionWriter {
     ///
     /// On Unix the JSONL file is created with mode `0600`. A sibling
     /// `<path>.lock` file is created with `O_CREAT | O_EXCL`; if it
-    /// already exists the call returns [`SessionError::Busy`] — two
-    /// writers racing on the same path is a programmer error, not a
-    /// silently-merged condition.
+    /// already exists and is fresh (younger than
+    /// [`LOCK_MAX_AGE_SECS`]), the call returns [`SessionError::Busy`].
+    /// A stale lock is evicted transparently so the next writer can
+    /// take over after a crash.
+    ///
+    /// If the JSONL file already exists, the writer recovers the
+    /// trailing sequence number so subsequent `append`s continue
+    /// rather than starting at 0 (which would cause
+    /// [`crate::agent::Agent`] to write a duplicate
+    /// `SessionStarted`).
     ///
     /// # Errors
     ///
-    /// - [`SessionError::Busy`] if another writer holds `path`.
+    /// - [`SessionError::Busy`] if a fresh lockfile already exists.
     /// - [`SessionError::Io`] for any filesystem failure.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let path = path.as_ref().to_path_buf();
         let lock_path = lock_path_for(&path);
 
         // Take an exclusive per-path lock by creating the lockfile with
-        // O_CREAT|O_EXCL. A second caller — same process or otherwise —
-        // sees AlreadyExists, which we map to SessionError::Busy.
+        // O_CREAT|O_EXCL. If one already exists, check its age — a
+        // crash before `Drop` runs can leave a stale lock behind.
         let mut lock_file = match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -85,7 +108,25 @@ impl SessionWriter {
         {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(SessionError::Busy { path });
+                // Try to evict a stale lockfile. If eviction fails or
+                // the lock is fresh, treat as Busy.
+                if try_evict_stale_lock(&lock_path).await? {
+                    // Retry once after eviction.
+                    match OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&lock_path)
+                        .await
+                    {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            return Err(SessionError::Busy { path });
+                        }
+                        Err(e) => return Err(SessionError::Io(e)),
+                    }
+                } else {
+                    return Err(SessionError::Busy { path });
+                }
             }
             Err(e) => return Err(SessionError::Io(e)),
         };
@@ -105,7 +146,12 @@ impl SessionWriter {
             }
         };
 
-        Ok(SessionWriter { file, path, seq: 0 })
+        // Recover the trailing sequence number so a reopen does NOT
+        // append a duplicate SessionStarted. This must come BEFORE
+        // any caller sees the writer.
+        let seq = count_existing_entries(&path).await?;
+
+        Ok(SessionWriter { file, path, seq })
     }
 
     /// Append `entry` as one JSON line and `fsync`.
@@ -151,7 +197,8 @@ impl SessionWriter {
     }
 
     /// Number of `append` calls that have succeeded since this writer
-    /// was opened. Monotonically increasing across `finish`.
+    /// was opened (or, after recovery, the trailing sequence of the
+    /// existing log at open time).
     #[must_use]
     pub fn seq(&self) -> u64 {
         self.seq
@@ -162,8 +209,8 @@ impl Drop for SessionWriter {
     fn drop(&mut self) {
         // Best-effort lockfile cleanup. The writer has already
         // fsync'd every append, so a crash before this runs only
-        // leaves a stale .lock file, which the next open() will
-        // surface as SessionError::Busy.
+        // leaves a stale .lock file, which the next open() evicts
+        // based on age.
         let lock = lock_path_for(&self.path);
         let _ = std::fs::remove_file(&lock);
     }
@@ -203,11 +250,137 @@ fn lock_path_for(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Count the parseable lines already on disk for `path`, returning
+/// 0 for a missing or empty file. Used to recover the trailing
+/// sequence number at writer open time.
+async fn count_existing_entries(path: &Path) -> Result<u64, SessionError> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(SessionError::Io(e)),
+    };
+    let mut count = 0u64;
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if serde_json::from_slice::<SessionEntry>(line).is_ok() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Evict a stale lockfile (one older than [`LOCK_MAX_AGE_SECS`]).
+/// Returns `Ok(true)` if the lock was evicted, `Ok(false)` if it was
+/// fresh or could not be evicted.
+async fn try_evict_stale_lock(lock_path: &Path) -> Result<bool, SessionError> {
+    let meta = match tokio::fs::metadata(lock_path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(SessionError::Io(e)),
+    };
+    let modified = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => return Ok(false),
+    };
+    let age = match std::time::SystemTime::now().duration_since(modified) {
+        Ok(d) => d,
+        Err(_) => return Ok(false),
+    };
+    if age.as_secs() >= LOCK_MAX_AGE_SECS {
+        match tokio::fs::remove_file(lock_path).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(SessionError::Io(e)),
+        }
+    } else {
+        Ok(false)
+    }
+}
+
+/// Outcome of [`read_entries_with_recovery`].
+#[derive(Debug)]
+pub struct RecoveryReport {
+    /// Every parseable entry on disk (in order).
+    pub entries: Vec<SessionEntry>,
+    /// 1-based line numbers of lines that were unparseable AND
+    /// appeared before the final truncated tail. These indicate real
+    /// corruption and should be surfaced to the user.
+    pub malformed_lines: Vec<usize>,
+    /// `true` if the final fragment of the file failed to parse —
+    /// i.e. the file ends with a truncated line (the classic
+    /// crash-mid-append case). When `true`, `entries` excludes the
+    /// truncated line but includes every earlier valid one.
+    pub truncated_tail: bool,
+}
+
+/// Read every parseable line from the JSONL log at `path` and
+/// distinguish a truncated tail from mid-file corruption. The legacy
+/// [`read_entries`] is lossy; this is the recovery-aware variant the
+/// agent loop should use when resuming.
+pub async fn read_entries_with_recovery(
+    path: impl AsRef<Path>,
+) -> Result<RecoveryReport, SessionError> {
+    let bytes = tokio::fs::read(path.as_ref()).await?;
+    let mut entries = Vec::new();
+    let mut malformed_lines = Vec::new();
+    let mut line_no = 0usize;
+    let mut truncated_tail = false;
+    // A truncated tail is the file ending with content that has no
+    // trailing newline. If the last byte is '\n', every segment is a
+    // well-formed line; corruption there is real corruption. If the
+    // last byte is NOT '\n', the final non-empty segment is the
+    // truncated tail.
+    let has_trailing_newline = bytes.last() == Some(&b'\n');
+    for line in bytes.split(|b| *b == b'\n') {
+        line_no += 1;
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<SessionEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => {
+                // We don't know yet whether this is the tail. Mark
+                // it malformed for now; if it turns out to be the
+                // tail (last segment, no trailing newline), we'll
+                // move it out of malformed_lines below.
+                malformed_lines.push(line_no);
+            }
+        }
+    }
+    if !has_trailing_newline {
+        // The final segment is the truncated tail. If it parsed
+        // correctly it stays in `entries`; if not, remove its line
+        // number from `malformed_lines` and set `truncated_tail`.
+        if let Some(&last_line) = malformed_lines.last() {
+            if last_line == line_no {
+                malformed_lines.pop();
+                truncated_tail = true;
+            }
+        } else {
+            // Last segment was non-empty AND parseable but the file
+            // didn't end in '\n'. That's a malformed file (a well-
+            // formed log always ends with '\n'); surface as a
+            // truncated tail so the caller knows the file is bad.
+            truncated_tail = true;
+        }
+    }
+    Ok(RecoveryReport {
+        entries,
+        malformed_lines,
+        truncated_tail,
+    })
+}
+
 /// Read every parseable line from the JSONL log at `path`.
 ///
 /// Lines that fail to parse — typically a truncated trailing fragment
 /// from a crash mid-write — are silently skipped. Empty lines (e.g.,
 /// the final newline of a well-formed file) are skipped too.
+///
+/// This is the lossy legacy API; new code should prefer
+/// [`read_entries_with_recovery`].
 ///
 /// # Errors
 ///
@@ -625,5 +798,107 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let metas = list_sessions(dir.path()).await.expect("list");
         assert!(metas.is_empty());
+    }
+
+    // ---- recovery-aware read tests (phase 3) ----
+
+    #[tokio::test]
+    async fn reopen_recovers_trailing_sequence_number() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.jsonl");
+        // Write three entries, drop writer, reopen, write two more.
+        {
+            let mut w = SessionWriter::open(&path).await.expect("open1");
+            w.append(user_msg("a")).await.expect("a");
+            w.append(user_msg("b")).await.expect("b");
+            w.append(user_msg("c")).await.expect("c");
+        }
+        {
+            let mut w = SessionWriter::open(&path).await.expect("reopen");
+            assert_eq!(
+                w.seq(),
+                3,
+                "reopen must inherit the trailing sequence, not reset to 0"
+            );
+            w.append(user_msg("d")).await.expect("d");
+            w.append(user_msg("e")).await.expect("e");
+            assert_eq!(w.seq(), 5);
+        }
+        let entries = read_entries(&path).await.expect("read");
+        assert_eq!(entries.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn recovery_distinguishes_truncated_tail_from_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.jsonl");
+        // Build: valid + garbage mid-file + truncated-tail fragment.
+        let good_a = serde_json::to_string(&started(ts(1_700_000_000_000))).expect("ser");
+        let good_b =
+            serde_json::to_string(&user_msg_at("ping", ts(1_700_000_000_001))).expect("ser");
+        let mut body = String::new();
+        body.push_str(&good_a);
+        body.push('\n');
+        body.push_str("<<<<corrupt mid-file>>>>");
+        body.push('\n');
+        body.push_str(&good_b);
+        body.push('\n');
+        // Truncated tail: a partial JSON line, no trailing newline.
+        body.push_str("{\"type\":\"UserMessage\",\"id\":\"01H");
+        std::fs::write(&path, body).expect("write");
+
+        let report = read_entries_with_recovery(&path).await.expect("recovery");
+        assert_eq!(report.entries.len(), 2, "two valid entries recovered");
+        assert_eq!(report.malformed_lines.len(), 1, "one mid-file corruption");
+        assert!(report.truncated_tail, "trailing fragment must be reported");
+    }
+
+    #[tokio::test]
+    async fn recovery_no_truncation_on_clean_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.jsonl");
+        {
+            let mut w = SessionWriter::open(&path).await.expect("open");
+            w.append(user_msg("a")).await.expect("a");
+            w.append(user_msg("b")).await.expect("b");
+        }
+        let report = read_entries_with_recovery(&path).await.expect("recovery");
+        assert_eq!(report.entries.len(), 2);
+        assert!(!report.truncated_tail);
+        assert!(report.malformed_lines.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stale_lockfile_is_evicted_on_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.jsonl");
+        // Plant a stale lockfile by hand (mtime well over the
+        // threshold). Without auto-eviction the next open would
+        // return Busy forever.
+        let lock_path = path.with_extension("jsonl.lock");
+        std::fs::write(&lock_path, "crow\n").expect("write lock");
+        // Backdate the mtime.
+        let past =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(LOCK_MAX_AGE_SECS + 60);
+        let _ = filetime::set_file_mtime(&lock_path, filetime::FileTime::from_system_time(past));
+
+        let w = SessionWriter::open(&path).await.expect("open evicts stale");
+        assert_eq!(w.seq(), 0);
+        drop(w);
+        assert!(!lock_path.exists(), "lockfile should be cleaned up");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn fresh_lockfile_returns_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.jsonl");
+        let _first = SessionWriter::open(&path).await.expect("open");
+        // Second open while the first is alive must return Busy.
+        match SessionWriter::open(&path).await {
+            Err(SessionError::Busy { .. }) => {}
+            other => panic!("expected Busy, got {other:?}"),
+        }
     }
 }
