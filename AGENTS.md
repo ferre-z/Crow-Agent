@@ -8,13 +8,31 @@ Unit tests are colocated in `#[cfg(test)]` modules. Cross-module integration cov
 
 ## Build, Test, and Development Commands
 
+A Makefile wraps the standard cargo invocations so a single `make <target>` runs them:
+
+- `make help` — list every target
+- `make test` — runs the deterministic test suite (no API key needed)
+- `make build` — release build into `target/release/crow`
+- `make lint` — clippy with `-D warnings`
+- `make fmt` / `make fmt-check` — apply / verify rustfmt
+- `make install` — `cargo install --path . --locked` (puts `crow` in `~/.cargo/bin`)
+- `make smoke` — release build + `crow --version && crow doctor`
+- `make ci` — `fmt-check + lint + build + test` (mirrors `.github/workflows/ci.yml`)
+
+Underlying cargo equivalents (still work directly):
+
 - `cargo build` compiles a debug build using the pinned Rust 1.88 toolchain.
 - `cargo run -- <args>` runs the local CLI; use `cargo run --release` for an optimized build.
 - `cargo test --all-targets --all-features` runs the complete deterministic test suite.
 - `cargo fmt --all -- --check` verifies formatting without changing files.
 - `cargo clippy --all-targets --all-features -- -D warnings` applies the repository's lint policy and treats warnings as failures.
 
-Run all three checks before opening a pull request. Tests use a scripted mock provider and require neither network access nor `NVIDIA_API_KEY`.
+Run `make ci` (or all three cargo checks) before opening a pull request. Tests use a scripted mock provider and require neither network access nor `NVIDIA_API_KEY`.
+
+## One-line scripts
+
+- `bash scripts/install.sh` — clone, build, install to `~/.cargo/bin`.
+- `bash scripts/test.sh` — wrapper around `make test`, usable from any cwd.
 
 ## Coding Style & Naming Conventions
 

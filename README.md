@@ -4,6 +4,33 @@ A small autonomous coding agent in Rust. Mirrors the workflow of Pi, Claude Code
 
 The first milestone is a reliable personal tool, not a platform. Keep the kernel small and extensible.
 
+## Quick start
+
+Install (one line):
+
+```bash
+curl -sSf https://raw.githubusercontent.com/ferre-z/Crow-Agent/main/scripts/install.sh | sh
+```
+
+This clones the repo, builds a release binary, installs it to `~/.cargo/bin/crow`, and prints a PATH hint if needed.
+
+Test from a fresh clone (one line):
+
+```bash
+git clone https://github.com/ferre-z/Crow-Agent.git /tmp/crow && cd /tmp/crow && make test
+```
+
+The test suite is fully deterministic — no API key, no network required.
+
+Try it:
+
+```bash
+crow --version
+crow doctor
+```
+
+Other useful targets: `make build`, `make lint`, `make install`, `make smoke`, `make ci`. Run `make help` for the full list.
+
 ## Status
 
 **v0 in active development.** Shipped so far:
@@ -68,21 +95,33 @@ The desktop app (Tauri 2) is a separate crate that talks to the same kernel via 
 ## Building
 
 ```bash
-cargo build --release
-cargo test --all-targets --all-features
+make test     # offline test suite, no API key needed
+make build    # release build (target/release/crow)
+make lint     # clippy with -D warnings
+make ci       # fmt + lint + build + test (matches GitHub Actions)
 ```
 
-Requires Rust toolchain pinned in `rust-toolchain.toml`.
+Raw cargo equivalents work too — the Makefile just wraps them:
+
+```bash
+cargo build --release
+cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Requires the Rust toolchain pinned in `rust-toolchain.toml` (1.88). rustup picks it up automatically on `cd`.
 
 ## Running
 
 ```bash
-cargo run --release -- --version
-cargo run --release -- doctor                       # validate config
-cargo run --release -- sessions                     # list sessions
-cargo run --release -- exec "describe this repo"   # one-shot task
-cargo run --release -- resume <session-id> "..."   # resume a session
+make run -- --version           # forwards args to cargo run
+make run -- doctor              # validate config
+make run -- sessions            # list sessions
+make run -- exec "..."          # one-shot task
+make run -- resume <id> "..."   # resume a session
 ```
+
+Or directly via the installed binary: `crow --version`, `crow doctor`, etc.
 
 Live Nemotron requires `NVIDIA_API_KEY` (or `CROW_API_KEY`) in the environment. The repository ships with a scripted mock provider so deterministic tests run without network access.
 
