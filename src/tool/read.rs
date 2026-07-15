@@ -28,19 +28,28 @@
 //! If the produced output exceeds `ctx.max_output_bytes`, we truncate
 //! at the nearest byte boundary that does not split a UTF-8 codepoint
 //! and set `truncated: true`. We never read past `offset + limit`
-//! lines from disk.
+//! lines from disk; the read itself is also bounded to
+//! `max_output_bytes + 8 KiB` so a hostile file can't allocate
+//! gigabytes before we notice.
 
-use std::fs;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use schemars::{schema::Schema, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use super::path::{looks_binary, safe_resolve};
 use super::{Tool, ToolContext, ToolError, ToolEventSink, ToolOutcome, ToolResult};
+
+/// Maximum bytes we read from a single file, regardless of what the
+/// caller asked for. Acts as a safety net against multi-gigabyte
+/// "reads" that would balloon memory before the line-slicer gets to
+/// run. Sized to comfortably cover the largest plausible formatted
+/// output (1 MiB cap + line-number prefix overhead + slack).
+const HARD_READ_CAP_BYTES: usize = 8 * 1024 * 1024;
 
 /// Arguments for the `read` tool.
 ///
@@ -71,15 +80,10 @@ pub struct ReadTool;
 impl ReadTool {
     pub const NAME: &'static str = "read";
 
-    /// Read a file in its entirety (after `safe_resolve`) into a
-    /// `String`, then run it through [`format_lines`] with `offset` /
-    /// `limit`. Split out so the integration tests in
-    /// `tests/tool_registry.rs` can exercise the formatting path
-    /// without a `ToolContext`.
-    ///
-    /// Returns the formatted output (possibly truncated to
-    /// `max_output_bytes`) and the `truncated` flag.
-    fn read_and_format(
+    /// Async, bounded read: sniff the first 8 KiB for binary
+    /// classification, then read up to `HARD_READ_CAP_BYTES` total,
+    /// then format and truncate.
+    async fn read_and_format(
         &self,
         project_root: &std::path::Path,
         args: &ReadArgs,
@@ -105,40 +109,61 @@ impl ReadTool {
             }
         })?;
 
-        // 2. Must be a regular file.
-        let meta = fs::metadata(&resolved).map_err(ToolError::Io)?;
+        // 2. Must be a regular file. tokio metadata is async-safe.
+        let meta = tokio::fs::metadata(&resolved)
+            .await
+            .map_err(ToolError::Io)?;
         if !meta.is_file() {
             return Err(ToolError::NotAFile(resolved));
         }
 
-        // 3. Read the bytes.
-        let bytes = fs::read(&resolved).map_err(ToolError::Io)?;
-
-        // 4. Mid-read cancellation check. (Reading from a small file
-        // is effectively synchronous, but if we ever swap to tokio's
-        // async fs we want the cancel check to fire here too.)
+        // 3. Binary sniff on the first 8 KiB. If binary, we don't
+        // even bother reading the rest of the file.
+        let mut sniff = [0u8; 8192];
+        let mut sniff_file = tokio::fs::File::open(&resolved)
+            .await
+            .map_err(ToolError::Io)?;
+        let sniff_len = tokio::io::AsyncReadExt::read(&mut sniff_file, &mut sniff)
+            .await
+            .map_err(ToolError::Io)?;
+        if looks_binary(&sniff[..sniff_len]) {
+            return Err(ToolError::Binary(resolved));
+        }
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
 
-        // 5. Binary check — only on the first 8 KiB, which is what
-        // `looks_binary` already caps at. We don't need a second
-        // slice.
-        if looks_binary(&bytes) {
-            return Err(ToolError::Binary(resolved));
+        // 4. Read the rest of the file, bounded by `HARD_READ_CAP_BYTES`.
+        let remaining_cap = HARD_READ_CAP_BYTES.saturating_sub(sniff_len);
+        let mut buf: Vec<u8> = Vec::with_capacity(sniff_len + remaining_cap.min(64 * 1024));
+        buf.extend_from_slice(&sniff[..sniff_len]);
+        let mut handle = sniff_file.take(remaining_cap as u64);
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut handle, &mut buf)
+            .await
+            .map_err(ToolError::Io)?;
+        let truncated_at_cap = buf.len() >= HARD_READ_CAP_BYTES;
+
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
         }
 
-        // 6. Decode UTF-8 (lossily so a stray byte doesn't crash
+        // 5. Decode UTF-8 (lossily so a stray byte doesn't crash
         // the agent; replacement char is fine for diagnostic
         // purposes).
-        let text = String::from_utf8_lossy(&bytes);
+        let text = String::from_utf8_lossy(&buf);
 
-        // 7. Slice by offset/limit, then format with line numbers.
+        // 6. Slice by offset/limit, then format with line numbers.
         let (sliced, offset_applied) = apply_offset_limit(&text, args.offset, args.limit);
         let formatted = format_lines(&sliced, offset_applied);
 
-        // 8. Truncate to the byte cap at a char boundary, set flag.
-        let (output, truncated) = truncate_to_bytes(&formatted, max_output_bytes);
+        // 7. Truncate to the byte cap at a char boundary, set flag.
+        let (output, mut truncated) = truncate_to_bytes(&formatted, max_output_bytes);
+        if truncated_at_cap {
+            // We stopped reading from disk mid-file; downstream slicing
+            // may have produced something smaller than the cap, but
+            // the file was definitely truncated, so signal it.
+            truncated = true;
+        }
         Ok(ToolOutcome::Success { output, truncated })
     }
 }
@@ -174,6 +199,7 @@ impl Tool for ReadTool {
         let parsed: ReadArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
         self.read_and_format(&ctx.project_root, &parsed, ctx.max_output_bytes, &cancel)
+            .await
     }
 }
 
@@ -321,6 +347,7 @@ mod tests {
         };
         let outcome = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &CancellationToken::new())
+            .await
             .unwrap();
         let ToolOutcome::Success { output, truncated } = outcome else {
             panic!("expected Success");
@@ -345,6 +372,7 @@ mod tests {
         };
         let outcome = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &CancellationToken::new())
+            .await
             .unwrap();
         let ToolOutcome::Success { output, truncated } = outcome else {
             panic!("Success expected");
@@ -366,6 +394,7 @@ mod tests {
         };
         let outcome = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &CancellationToken::new())
+            .await
             .unwrap();
         let ToolOutcome::Success { output, truncated } = outcome else {
             panic!("Success expected");
@@ -391,6 +420,7 @@ mod tests {
         };
         let err = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &CancellationToken::new())
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Binary(_)));
     }
@@ -406,6 +436,7 @@ mod tests {
         };
         let err = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &CancellationToken::new())
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::NotAFile(_)));
     }
@@ -420,6 +451,7 @@ mod tests {
         };
         let err = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &CancellationToken::new())
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::PathEscape(_)));
     }
@@ -438,6 +470,7 @@ mod tests {
         };
         let err = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &CancellationToken::new())
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::PathEscape(_)));
     }
@@ -459,6 +492,7 @@ mod tests {
         };
         let err = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &CancellationToken::new())
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::PathEscape(_)));
     }
@@ -481,6 +515,7 @@ mod tests {
         };
         let outcome = ReadTool
             .read_and_format(tmp.path(), &args, 1024, &CancellationToken::new())
+            .await
             .unwrap();
         let ToolOutcome::Success { output, truncated } = outcome else {
             panic!("Success expected");
@@ -504,6 +539,7 @@ mod tests {
         };
         let outcome = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &CancellationToken::new())
+            .await
             .unwrap();
         let ToolOutcome::Success { output, truncated } = outcome else {
             panic!("Success expected");
@@ -524,6 +560,7 @@ mod tests {
         };
         let err = ReadTool
             .read_and_format(tmp.path(), &args, 4096, &cancelled_token())
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Cancelled));
     }
