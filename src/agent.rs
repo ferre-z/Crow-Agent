@@ -691,6 +691,7 @@ impl Agent {
                         &self.tools,
                         &call,
                         ToolContext {
+                            call_id: call.call_id,
                             project_root: self.config.project_root.clone(),
                             max_output_bytes: 1_048_576,
                             command_timeout: Duration::from_secs(30),

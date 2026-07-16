@@ -62,6 +62,13 @@ use crate::ids::ToolCallId;
 /// rather than threading an `Arc` through every call site.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
+    /// Identifier of the call this tool execution belongs to. Tools
+    /// that emit live events (`ToolOutput` chunks from the bash tool)
+    /// MUST carry this id on every event so consumers can correlate
+    /// chunks with the parent `ToolStarted`/`ToolFinished` event.
+    /// Tools that don't emit events can ignore the field; the agent
+    /// loop fills it in unconditionally.
+    pub call_id: ToolCallId,
     /// Absolute path that bounds every filesystem tool. A tool MUST NOT
     /// read or write anything outside this root (spec §4).
     pub project_root: PathBuf,
@@ -520,6 +527,7 @@ mod tests {
 
     fn ctx() -> ToolContext {
         ToolContext {
+            call_id: ToolCallId(crate::ids::new_id()),
             project_root: PathBuf::from("/tmp"),
             max_output_bytes: 4096,
             command_timeout: Duration::from_secs(5),

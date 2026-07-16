@@ -323,6 +323,7 @@ mod tests {
 
     fn ctx_for(root: &std::path::Path, max_bytes: usize) -> ToolContext {
         ToolContext {
+            call_id: crate::ids::ToolCallId(crate::ids::new_id()),
             project_root: root.to_path_buf(),
             max_output_bytes: max_bytes,
             command_timeout: std::time::Duration::from_secs(5),

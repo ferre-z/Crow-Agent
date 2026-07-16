@@ -53,6 +53,7 @@ impl BashTool {
                 .unwrap_or(ctx.command_timeout.as_millis() as u64),
         );
         let byte_cap = ctx.max_output_bytes;
+        let call_id = ctx.call_id;
 
         let mut cmd = build_shell_command(&args.command);
         cmd.current_dir(project_root)
@@ -77,6 +78,7 @@ impl BashTool {
             stdout,
             byte_cap,
             ToolStream::Stdout,
+            call_id,
             events.clone(),
             cancel.clone(),
         ));
@@ -84,6 +86,7 @@ impl BashTool {
             stderr,
             byte_cap,
             ToolStream::Stderr,
+            call_id,
             events.clone(),
             cancel.clone(),
         ));
@@ -230,11 +233,15 @@ struct Captured {
 }
 
 /// Read a stream line-by-line, accumulate into a bounded buffer, and
-/// forward each line to the event sink as `ToolOutput`.
+/// forward each line to the event sink as `ToolOutput`. Each emitted
+/// event carries the real `call_id` from the tool context, so
+/// consumers can correlate chunks with the parent `ToolStarted` /
+/// `ToolFinished` pair.
 async fn capture_stream<R>(
     reader: R,
     byte_cap: usize,
     stream: ToolStream,
+    call_id: crate::ids::ToolCallId,
     events: ToolEventSink,
     cancel: CancellationToken,
 ) -> Captured
@@ -263,7 +270,7 @@ where
                 }
                 let _ = events
                     .send(AgentEvent::ToolOutput {
-                        call_id: crate::ids::ToolCallId(crate::ids::new_id()),
+                        call_id,
                         stream: stream.clone(),
                         chunk: line.into_bytes(),
                     })
@@ -284,6 +291,7 @@ mod tests {
 
     fn ctx_with(root: &std::path::Path, timeout: Duration, max_bytes: usize) -> ToolContext {
         ToolContext {
+            call_id: crate::ids::ToolCallId(crate::ids::new_id()),
             project_root: root.to_path_buf(),
             max_output_bytes: max_bytes,
             command_timeout: timeout,
@@ -396,6 +404,92 @@ mod tests {
             // this host. The pre_exec test above is the sensitive
             // assertion; this test is the integration.
             eprintln!("skip: /bin/bash not available");
+        }
+    }
+
+    /// Regression for the `ToolOutput` call_id bug. Before the fix,
+    /// `capture_stream` invented a fresh `ToolCallId::new_id()` for
+    /// every output chunk, so consumers couldn't correlate chunks
+    /// with the parent `ToolStarted`/`ToolFinished` pair. After the
+    /// fix, every `ToolOutput` carries the real call id from
+    /// `ToolContext`.
+    ///
+    /// Test design: construct a `ToolContext` with a known call id,
+    /// run the bash tool, drain the event sink, and assert every
+    /// `ToolOutput` event matches the known id. A second assertion
+    /// verifies the existing "no event has a *different* call id"
+    /// invariant — without the fix we'd see N different ids for N
+    /// chunks of output.
+    #[tokio::test]
+    async fn tool_output_events_carry_real_call_id() {
+        let tmp = TempDir::new().unwrap();
+        let tool = BashTool;
+        let (tx, mut rx) = mpsc::channel(64);
+        let known_id = crate::ids::ToolCallId(crate::ids::new_id());
+        let mut ctx = ctx_with(tmp.path(), Duration::from_secs(5), 4096);
+        ctx.call_id = known_id;
+        // Multiple lines of output so we get multiple `ToolOutput`
+        // events — that way the test distinguishes "all chunks share
+        // a call id" (fix) from "every chunk has a different id"
+        // (bug).
+        let outcome = tool
+            .run_command(
+                tmp.path(),
+                &BashArgs {
+                    command: "printf 'one\\ntwo\\nthree\\n'".into(),
+                    timeout_ms: None,
+                },
+                &ctx,
+                tx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            ToolOutcome::Success { output, .. } => {
+                assert!(output.contains("one"));
+                assert!(output.contains("two"));
+                assert!(output.contains("three"));
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // Drain the event sink; collect all `ToolOutput` events.
+        let mut output_events: Vec<AgentEvent> = Vec::new();
+        // Some channels race ahead; bound by a small wait so a
+        // regression that emits a wrong-id event is caught but a
+        // missing event isn't a flake.
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= drain_deadline {
+                break;
+            }
+            let remaining = drain_deadline - now;
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(event)) => {
+                    if matches!(event, AgentEvent::ToolOutput { .. }) {
+                        output_events.push(event);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !output_events.is_empty(),
+            "expected at least one ToolOutput event; got none"
+        );
+        for event in &output_events {
+            match event {
+                AgentEvent::ToolOutput { call_id, .. } => {
+                    assert_eq!(
+                        *call_id, known_id,
+                        "ToolOutput event has call_id {call_id:?} \
+                         but expected {known_id:?} (the real call id)"
+                    );
+                }
+                other => panic!("expected ToolOutput, got {other:?}"),
+            }
         }
     }
 
