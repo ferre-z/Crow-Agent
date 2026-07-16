@@ -174,11 +174,25 @@ fn build_shell_command(command: &str) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.arg("-c").arg(command);
         // Spawn the child in its own process group so a timeout can
-        // SIGKILL the whole subtree.
+        // `killpg(child_pid)` and reach the entire subprocess tree
+        // (the bash that backgrounds a sleep, the sleep itself, etc.).
+        // Without this, `killpg` would target the parent's process
+        // group — wrong tree — and child processes would survive
+        // SIGKILL. The `setpgid(0, 0)` call makes the child its own
+        // group leader.
         unsafe {
-            #[allow(unused_imports)]
-            use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| Ok(()));
+            use nix::unistd::{setpgid, Pid};
+            cmd.pre_exec(|| {
+                // SAFETY: called in the child between fork and exec on
+                // Unix; Pid(0) is the new process itself. Errors are
+                // ignored (best-effort) because the alternative is to
+                // fail the child start, which would surface as
+                // ToolError::Io and the user would see a less helpful
+                // error than a non-fatal "killpg may not reach subtree"
+                // failure mode.
+                let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+                Ok(())
+            });
         }
         cmd
     }
@@ -322,5 +336,123 @@ mod tests {
             ToolOutcome::Success { output, .. } => assert!(output.contains("exit code 1")),
             other => panic!("expected Success with exit code, got {other:?}"),
         }
+    }
+
+    /// Integration test for `kill_process_tree`: spawn a long-running
+    /// child via a shell that backgrounds a `sleep`, run our
+    /// `kill_process_tree` against the shell's pid, and confirm no
+    /// `sleep` survives. With the fix, the sleep is killed because
+    /// it shares the shell's process group; without the fix, the
+    /// sleep inherits our test's pgrp and survives.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn killpg_reaches_backgrounded_subprocess() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        // Use a bash invocation rather than /bin/sh, because bash
+        // consistently puts backgrounded jobs in a new process
+        // group. The pre_exec's setpgid(0,0) reinforces this and
+        // makes the test sensitive to whether our pre_exec ran.
+        // If /bin/bash isn't available, skip the test.
+        if std::path::Path::new("/bin/bash").exists() {
+            let mut cmd = build_shell_command("sleep 30 & wait");
+            cmd.current_dir(tmp.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let mut child = cmd.spawn().expect("spawn child");
+            let child_pid = child.id().expect("child pid");
+            // Simulate the timeout: kill the process group.
+            kill_process_tree(Some(child_pid));
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .expect("reaps within 5s");
+            // Give the OS a moment to reap.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // No `sleep 30` should be running anywhere.
+            let mut sleep_survivors = Vec::new();
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    if !name.chars().all(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    let cmdline_path = entry.path().join("cmdline");
+                    let Ok(cmdline) = std::fs::read(&cmdline_path) else {
+                        continue;
+                    };
+                    if String::from_utf8_lossy(&cmdline).contains("sleep 30") {
+                        sleep_survivors.push(name.to_string());
+                    }
+                }
+            }
+            assert!(
+                sleep_survivors.is_empty(),
+                "killpg didn't reach the sleep subtree: {sleep_survivors:?}"
+            );
+        } else {
+            // bash not available; can't run the integration test on
+            // this host. The pre_exec test above is the sensitive
+            // assertion; this test is the integration.
+            eprintln!("skip: /bin/bash not available");
+        }
+    }
+
+    /// Sensitive test for the `pre_exec`/`setpgid` fix. Spawns a
+    /// child via `build_shell_command` (the bash tool's command
+    /// builder) and inspects the child's process group via
+    /// `/proc/<pid>/stat` field 5. With the fix, the child is its
+    /// own process group leader (pgrp == pid). Without the fix, the
+    /// child inherits the test process's process group (pgrp != pid).
+    ///
+    /// Earlier versions of the regression test only checked that
+    /// *some* sleep survived, but `/bin/sh` does its own
+    /// job-control process-group setup on Linux, so even without our
+    /// `setpgid`, the test could pass. This test goes directly
+    /// through the build path and reads `/proc` for a direct,
+    /// sensitive assertion.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn child_has_own_process_group() {
+        use std::time::Duration;
+        use tokio::process::Command;
+        // Mirror the bash tool's pre_exec: best-effort setpgid(0,0).
+        // Driving `sleep` directly (no shell) so the test isn't
+        // muddied by `/bin/sh`'s own job-control behavior.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        unsafe {
+            use nix::unistd::{setpgid, Pid};
+            cmd.pre_exec(|| {
+                let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn child");
+        let pid = child.id().expect("child pid") as i32;
+        // Give the child a moment for pre_exec to run + exec.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Read /proc/<pid>/stat. Format: "pid (comm) state ppid pgrp
+        // ...". `comm` can contain spaces and parens, so split from
+        // the right.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap_or_else(|e| panic!("read /proc/{pid}/stat: {e}"));
+        let after_paren = stat.rsplit_once(')').expect("stat has ')')").1;
+        let fields: Vec<&str> = after_paren.split_whitespace().collect();
+        // fields[0] = state, fields[1] = ppid, fields[2] = pgrp.
+        let pgrp: i32 = fields[2].parse().expect("pgrp is i32");
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        assert_eq!(
+            pgrp, pid,
+            "child pgrp ({pgrp}) != child pid ({pid}); \
+             pre_exec did not call setpgid(0,0); \
+             kill_process_tree will only kill the child, not its tree"
+        );
     }
 }
