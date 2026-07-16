@@ -20,6 +20,7 @@ pub mod config;
 pub mod context;
 pub mod event;
 pub mod ids;
+pub mod mcp_opencode;
 pub mod message;
 pub mod policy;
 pub mod provider;

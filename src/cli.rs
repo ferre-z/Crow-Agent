@@ -80,6 +80,15 @@ pub enum Command {
     /// Used by the Tauri desktop (and external CLIs in any language)
     /// to drive the kernel without linking it.
     Serve,
+    /// Run the MCP server (Model Context Protocol, JSON-RPC over stdio)
+    /// that delegates tasks to the `opencode` CLI, optionally in parallel.
+    /// Configure your MCP client (e.g. Claude Code) to launch
+    /// `crow mcp-opencode` and the seven opencode_* tools will appear.
+    McpOpencode {
+        /// Path to the `opencode` binary. Defaults to `opencode` on $PATH.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
 }
 
 /// Run the CLI based on parsed args. Returns `Ok` on a successful
@@ -113,6 +122,14 @@ pub async fn run(args: Cli) -> Result<()> {
         Command::Resume { session_id, prompt } => resume(&config, session_id, prompt).await,
         Command::Doctor { live } => doctor(&config, live).await,
         Command::Serve => crate::app_server::run().await,
+        Command::McpOpencode { binary } => {
+            let binary = binary.clone().unwrap_or_else(|| PathBuf::from("opencode"));
+            // Hand the crate's own version string to the server so
+            // the `initialize` response advertises it under
+            // `serverInfo.version`.
+            let version = Arc::new(env!("CARGO_PKG_VERSION").to_string());
+            crate::mcp_opencode::run(binary, version).await
+        }
     }
 }
 
