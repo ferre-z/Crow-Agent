@@ -507,9 +507,9 @@ case "$mode" in
       echo "┌─────────────────────────────────────────────┐"
       echo "│  Installation complete!                     │"
       echo "├─────────────────────────────────────────────┤"
-      printf "│  path:    %-33s│\n" "$install_bin"
-      printf "│  version: %-33s│\n" "$($install_bin --version 2>/dev/null || echo 'unknown')"
-      printf "│  profile: %-33s│\n" "$build_profile"
+      printf "│  path:    %-34s│\n" "$install_bin"
+      printf "│  version: %-34s│\n" "$($install_bin --version 2>/dev/null || echo 'unknown')"
+      printf "│  profile: %-34s│\n" "$build_profile"
       echo "└─────────────────────────────────────────────┘"
     else
       fail "$install_bin not found after install"
