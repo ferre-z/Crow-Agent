@@ -1,0 +1,126 @@
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@font-face {
+  font-family: "Clash Display";
+  src: url("/fonts/clash-display/ClashDisplay-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Clash Display";
+  src: url("/fonts/clash-display/ClashDisplay-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Clash Display";
+  src: url("/fonts/clash-display/ClashDisplay-Semibold.woff2") format("woff2");
+  font-weight: 600;
+  font-display: swap;
+}
+
+@property --angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes rotate-angle {
+  to {
+    --angle: 360deg;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flow-border::before {
+    animation: none;
+  }
+
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+:root {
+  /* Palette */
+  --obsidian: #0E0F13;
+  --slate: #171A21;
+  --ash: #22262F;
+  --fog: #9AA3B2;
+  --mist: #E7EBF2;
+  --sheen: #4C82FB;
+  --iris: #6D5EF3;
+  --halo: #38BDF8;
+  --coral: #F2785C;
+
+  /* Semantic tokens */
+  --color-running: var(--sheen);
+  --color-success: var(--halo);
+  --color-error: var(--coral);
+  --color-reasoning: var(--fog);
+}
+
+@layer components {
+  .clay {
+    background: linear-gradient(180deg, #1C1F27 0%, var(--slate) 100%);
+    border-radius: 24px;
+    box-shadow:
+      6px 6px 14px rgba(0, 0, 0, 0.5),
+      -2px -2px 6px rgba(255, 255, 255, 0.04);
+  }
+
+  .clay-inset {
+    background: var(--ash);
+    border-radius: 16px;
+    box-shadow:
+      inset 3px 3px 8px rgba(0, 0, 0, 0.5),
+      inset -1px -1px 4px rgba(255, 255, 255, 0.04);
+  }
+
+  .flow-border {
+    position: relative;
+    border-radius: 24px;
+  }
+
+  .flow-border::before {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border-radius: inherit;
+    padding: 2px;
+    background: conic-gradient(
+      from var(--angle),
+      var(--sheen),
+      var(--iris),
+      var(--halo),
+      var(--sheen)
+    );
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    animation: rotate-angle 3s linear infinite;
+  }
+}
+
+/* Responsive: inspector as bottom sheet under 1100px */
+@media (max-width: 1099px) {
+  .inspector-sheet {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 40;
+    max-height: 50vh;
+    border-radius: 24px 24px 0 0;
+    overflow-y: auto;
+  }
+}
