@@ -89,6 +89,8 @@ pub enum Command {
         #[arg(long)]
         binary: Option<PathBuf>,
     },
+    /// Print the version string (same as --version).
+    Version,
 }
 
 /// Run the CLI based on parsed args. Returns `Ok` on a successful
@@ -129,6 +131,10 @@ pub async fn run(args: Cli) -> Result<()> {
             // `serverInfo.version`.
             let version = Arc::new(env!("CARGO_PKG_VERSION").to_string());
             crate::mcp_opencode::run(binary, version).await
+        }
+        Command::Version => {
+            println!("crow {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
         }
     }
 }
