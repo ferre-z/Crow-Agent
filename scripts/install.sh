@@ -42,6 +42,7 @@ print_path_hint=1
 bootstrap=1
 clean_after=1          # default for debug install
 yes_preflight=0
+_verbose=0
 bin_name="crow"
 rust_toolchain="1.88"
 
@@ -60,6 +61,7 @@ Options:
   --repo URL       git URL (default: ferre-z/Crow-Agent)
   --no-bootstrap   don't auto-install missing tools
   --no-path-hint   don't print the PATH export reminder
+  --verbose         show full cargo output during build
   -h, --help       show this help
 
 The script auto-installs Rust (via rustup) and basic build tools (via the
@@ -81,23 +83,68 @@ Examples:
 EOF
 }
 
+# --- output formatting -------------------------------------------------------
+# TTY detection: colour when stdout is a tty, plain when piped.
+# Honour NO_COLOR (https://no-color.org/).
+_color=0
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  _color=1
+fi
+
+if [ "$_color" = "1" ]; then
+  _green='\033[32m'
+  _red='\033[31m'
+  _yellow='\033[33m'
+  _cyan='\033[36m'
+  _bold='\033[1m'
+  _reset='\033[0m'
+else
+  _green=''
+  _red=''
+  _yellow=''
+  _cyan=''
+  _bold=''
+  _reset=''
+fi
+
+# Phase header: ==> Phase Name
+phase() {
+  printf "${_cyan}${_bold}==> %s${_reset}\n" "$1"
+}
+
+# Success marker: ✓ message
+ok() {
+  printf "  ${_green}✓${_reset} %s\n" "$1"
+}
+
+# Warning marker: ! message
+warn() {
+  printf "  ${_yellow}!${_reset} %s\n" "$1" >&2
+}
+
+# Error marker: ✗ message (to stderr)
+fail() {
+  printf "  ${_red}✗${_reset} %s\n" "$1" >&2
+}
+
 # Parse flags.
 while [ $# -gt 0 ]; do
   case "$1" in
     --test)           mode="test"; shift ;;
     --release)        build_profile="release"; clean_after=0; shift ;;
-    --path)           workdir="${2:-}"; shift 2 || { echo "install.sh: --path requires an argument" >&2; exit 1; } ;;
+    --path)           workdir="${2:-}"; shift 2 || { fail "--path requires an argument"; exit 1; } ;;
     --path=*)         workdir="${1#*=}"; shift ;;
-    --branch)         branch="${2:-}"; shift 2 || { echo "install.sh: --branch requires an argument" >&2; exit 1; } ;;
+    --branch)         branch="${2:-}"; shift 2 || { fail "--branch requires an argument"; exit 1; } ;;
     --branch=*)       branch="${1#*=}"; shift ;;
-    --repo)           repo="${2:-}"; shift 2 || { echo "install.sh: --repo requires an argument" >&2; exit 1; } ;;
+    --repo)           repo="${2:-}"; shift 2 || { fail "--repo requires an argument"; exit 1; } ;;
     --repo=*)         repo="${1#*=}"; shift ;;
     --no-bootstrap)   bootstrap=0; shift ;;
     --no-path-hint)   print_path_hint=0; shift ;;
     --no-clean)       clean_after=0; shift ;;
     -y|--yes)         yes_preflight=1; shift ;;
+    --verbose)        _verbose=1; shift ;;
     -h|--help)        usage; exit 0 ;;
-    *)                echo "install.sh: unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    *)                fail "unknown argument: $1"; usage >&2; exit 1 ;;
   esac
 done
 
@@ -105,7 +152,7 @@ done
 uname_s="$(uname -s)"
 case "$uname_s" in
   Linux|Darwin) ;;
-  *) echo "install.sh: unsupported platform '$uname_s' (Linux and macOS only)" >&2; exit 1 ;;
+  *) fail "unsupported platform '$uname_s' (Linux and macOS only)"; exit 1 ;;
 esac
 
 # --- helpers -----------------------------------------------------------------
@@ -247,7 +294,7 @@ install_rust() {
     tmp_avail_kib=$(df -k /tmp 2>/dev/null | awk 'NR==2 { print $4 }')
     if [ -n "$tmp_avail_kib" ] && [ "$tmp_avail_kib" -lt "$tmp_need_kib" ]; then
       echo "" >&2
-      echo "install.sh: not enough free space in /tmp for rustup-init" >&2
+      fail "not enough free space in /tmp for rustup-init"
       echo "  available: $((tmp_avail_kib / 1024)) MiB" >&2
       echo "  need:      ~50 MiB" >&2
       echo "" >&2
@@ -274,43 +321,45 @@ install_rust() {
   # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
   if ! have cargo; then
-    echo "install.sh: rustup install completed but cargo is still not on PATH" >&2
+    fail "rustup install completed but cargo is still not on PATH"
     exit 1
   fi
 }
 
 # --- bootstrap ---------------------------------------------------------------
 if [ "$bootstrap" = "1" ]; then
-  # 1) Scan once, upfront.
+  phase "Checking dependencies"
   scan_dependencies
   print_dep_table
 
-  # 2) One package-manager transaction for all missing system tools.
   if [ ${#_missing_system_pkgs[@]} -gt 0 ]; then
+    phase "Installing system packages"
     install_packages "${_missing_system_pkgs[@]}"
-    # Re-check after install.
     for pkg in "${_missing_system_pkgs[@]}"; do
       if ! have "$pkg"; then
-        echo "install.sh: '$pkg' is required but could not be auto-installed." >&2
-        echo "  Install it manually and re-run this script (or pass --no-bootstrap)." >&2
+        fail "'$pkg' could not be auto-installed"
+        echo "  Install it manually and re-run (or pass --no-bootstrap)." >&2
         exit 1
       fi
+      ok "$pkg installed"
     done
+  else
+    ok "All system packages present"
   fi
 
-  # 3) Rustup last — only after system tools are confirmed.
   if [ "$_need_rust" -eq 1 ]; then
-    # Source env if rustup already exists but cargo isn't on PATH.
+    phase "Installing Rust toolchain"
     if [ -x "$HOME/.cargo/bin/rustup" ]; then
-      echo "install.sh: sourcing existing rustup env"
-      # shellcheck disable=SC1091
       . "$HOME/.cargo/env"
+      ok "Reusing existing rustup"
     else
       install_rust
+      ok "Rust ${rust_toolchain} installed"
     fi
+  else
+    ok "Rust toolchain present"
   fi
 elif [ "$bootstrap" = "0" ]; then
-  # --no-bootstrap: scan + report, exit if anything missing.
   scan_dependencies
   print_dep_table
   missing=()
@@ -321,11 +370,11 @@ elif [ "$bootstrap" = "0" ]; then
   done
   if [ ${#missing[@]} -gt 0 ]; then
     echo "" >&2
-    echo "install.sh: --no-bootstrap but required tools missing: ${missing[*]}" >&2
+    fail "--no-bootstrap but required tools missing: ${missing[*]}"
     echo "  Install them manually and re-run." >&2
     exit 1
   fi
-  echo "install.sh: all dependencies satisfied"
+  ok "All dependencies satisfied"
 fi
 
 # --- final tool check ---------------------------------------------------------
@@ -337,7 +386,7 @@ for tool in git curl make cargo rustc; do
 done
 if [ ${#missing[@]} -gt 0 ]; then
   echo "" >&2
-  echo "install.sh: required tools still missing after bootstrap: ${missing[*]}" >&2
+  fail "required tools still missing after bootstrap: ${missing[*]}"
   echo "" >&2
   echo "  Install them manually, then re-run this script (or pass --no-bootstrap)." >&2
   exit 1
@@ -353,16 +402,18 @@ fi
 : "${CARGO_HOME:=$HOME/.cargo}"
 install_bin="$CARGO_HOME/bin/$bin_name"
 
-echo "install.sh: target directory: $workdir"
+phase "Preparing source"
+echo "  directory: $workdir"
 
-# Reuse existing checkout (idempotent) when present.
 if [ ! -d "$workdir/.git" ]; then
-  echo "install.sh: cloning $repo (branch $branch) — depth 1"
+  phase "Cloning repository"
   git clone --depth 1 --branch "$branch" "$repo" "$workdir"
+  ok "Cloned $repo (branch $branch)"
 else
-  echo "install.sh: reusing existing checkout at $workdir"
+  phase "Updating existing checkout"
   (cd "$workdir" && git fetch --depth 1 origin "$branch" && git checkout "$branch" && git reset --hard "origin/$branch") \
-    || echo "install.sh: warning: could not fast-forward existing checkout; continuing with current tree"
+    || warn "Could not fast-forward; using current tree"
+  ok "Reusing $workdir"
 fi
 
 cd "$workdir"
@@ -392,7 +443,7 @@ maybe_preflight_disk() {
   if [ "$avail_kib" -lt "$need_kib" ]; then
     local avail_mib=$((avail_kib / 1024))
     echo "" >&2
-    echo "install.sh: not enough free disk at $probe_dir" >&2
+    fail "not enough free disk at $probe_dir"
     echo "  available: ${avail_mib} MiB" >&2
     echo "  need (debug build): ~300 MiB" >&2
     echo "  need (release build with --release): ~600 MiB" >&2
@@ -404,68 +455,69 @@ maybe_preflight_disk() {
       echo "   - re-run with -y if you really want me to try anyway" >&2
       exit 1
     fi
-    echo "install.sh: continuing anyway (-y given)" >&2
+    warn "continuing anyway (-y given)"
   fi
 }
 
 # --- run --------------------------------------------------------------------
 run_cargo_in_step() {
-  # $1 = sub-step verb, $2.. = cargo args
   local verb="$1"
   shift
-  echo "install.sh: ${verb} (cargo $* )"
-  cargo "$@"
+  if [ "$_verbose" = "1" ]; then
+    echo "install.sh: ${verb} (cargo $*)"
+    cargo "$@"
+  else
+    echo "install.sh: ${verb} (cargo $* ) …"
+    cargo "$@" 2>&1 | tail -5
+  fi
 }
 
 case "$mode" in
   test)
+    phase "Running tests"
     maybe_preflight_disk
-    echo "install.sh: running test suite"
     if have make; then
       make test
     else
-      # Defensive fallback — bootstrap should have installed make.
-      echo "install.sh: 'make' missing; falling back to direct cargo test"
       run_cargo_in_step "test" test --all-targets --all-features
     fi
-    echo "install.sh: tests passed"
+    ok "Tests passed"
     ;;
   install)
     maybe_preflight_disk
     if [ "$build_profile" = "release" ]; then
-      echo "install.sh: building (release profile) and installing to $install_bin"
+      phase "Building (release) and installing"
       if have make; then
         make install-release
       else
-        # 'cargo install' defaults to release build.
         run_cargo_in_step "install" install --path . --locked
       fi
     else
-      echo "install.sh: building (debug profile) and installing to $install_bin"
-      # Debug build is much smaller on disk and fits on quota-limited
-      # boxes. We copy the binary to ~/.cargo/bin and then `cargo
-      # clean` so the build artifacts (~250 MiB) don't stick around.
+      phase "Building (debug) and installing"
       run_cargo_in_step "build" build --locked
       install -d "$CARGO_HOME/bin"
       install -m 0755 target/debug/$bin_name "$install_bin"
       if [ "$clean_after" = "1" ]; then
-        echo "install.sh: cleaning build artifacts"
         cargo clean >/dev/null 2>&1 || true
       fi
     fi
     echo ""
-    echo "install.sh: installed."
     if [ -x "$install_bin" ]; then
-      echo "  path: $install_bin"
-      echo "  version: $($install_bin --version)"
-      echo "  profile: $build_profile"
+      echo ""
+      echo "┌─────────────────────────────────────────────┐"
+      echo "│  Installation complete!                     │"
+      echo "├─────────────────────────────────────────────┤"
+      printf "│  path:    %-33s│\n" "$install_bin"
+      printf "│  version: %-33s│\n" "$($install_bin --version 2>/dev/null || echo 'unknown')"
+      printf "│  profile: %-33s│\n" "$build_profile"
+      echo "└─────────────────────────────────────────────┘"
     else
-      echo "install.sh: WARNING: $install_bin not found after install" >&2
+      fail "$install_bin not found after install"
       exit 1
     fi
     if [ "$print_path_hint" = "1" ]; then
       case ":$PATH:" in
-        *":$CARGO_HOME/bin:"*) : ;;  # already on PATH
+        *":$CARGO_HOME/bin:"*) : ;;
         *)
           echo ""
           echo "  ~/.cargo/bin is not on PATH. Add it:"
