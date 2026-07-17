@@ -223,6 +223,32 @@ impl Agent {
         Ok((agent, history))
     }
 
+    /// The session id this agent appends to. After [`Agent::resume_into`]
+    /// this is the persisted session's id, not a fresh one.
+    #[must_use]
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// The run id for the current/next `submit`. Fresh per agent
+    /// instance. Callers correlate streamed events by this value.
+    #[must_use]
+    pub fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    /// Emit a terminal `RunFailed` to the live event sink without
+    /// moving the values (the caller has usually already moved them
+    /// into a `SessionEntry::RunFailed` write). Used at every
+    /// failing exit that previously left the stream silent.
+    fn emit_run_failed(&self, code: ErrorCode, retryable: bool, message: &str) {
+        self.sink.on_event(AgentEvent::RunFailed {
+            code,
+            retryable,
+            message: message.to_string(),
+        });
+    }
+
     /// Append a user message and run the loop to completion.
     pub async fn submit(&mut self, user_msg: Message) -> Result<AgentEvent, AgentError> {
         self.ensure_not_cancelled().await?;
@@ -270,10 +296,12 @@ impl Agent {
             if serialized_len(&self.history).saturating_add(context_len) > 128_000 {
                 self.state = AgentState::Failed;
                 let failure = AgentError::ContextLimit;
+                let message = failure.to_string();
+                self.emit_run_failed(ErrorCode("context_limit".into()), false, &message);
                 self.append(SessionEntry::RunFailed {
                     code: ErrorCode("context_limit".into()),
                     retryable: false,
-                    message: failure.to_string(),
+                    message,
                     timestamp: Timestamp::now(),
                 })
                 .await?;
@@ -415,10 +443,12 @@ impl Agent {
                     }
                     Some(Err(error)) => {
                         let mapped = map_provider_error(error.clone());
+                        let message = error.to_string();
+                        self.emit_run_failed(ErrorCode("stream_error".into()), true, &message);
                         self.append(SessionEntry::RunFailed {
                             code: ErrorCode("stream_error".into()),
                             retryable: true,
-                            message: error.to_string(),
+                            message,
                             timestamp: Timestamp::now(),
                         })
                         .await?;
@@ -433,6 +463,11 @@ impl Agent {
                         // as a typed failure so the caller doesn't
                         // silently spin on the next turn.
                         if !last_event_seen && text.is_empty() && parts.is_empty() {
+                            self.emit_run_failed(
+                                ErrorCode("empty_stream".into()),
+                                true,
+                                "provider stream ended with no events",
+                            );
                             self.append(SessionEntry::RunFailed {
                                 code: ErrorCode("empty_stream".into()),
                                 retryable: true,
@@ -536,10 +571,12 @@ impl Agent {
                 total_tool_calls = total_tool_calls.saturating_add(tool_calls.len() as u32);
                 if total_tool_calls > self.config.max_tool_calls {
                     let failure = AgentError::MaxToolCallsExceeded(self.config.max_tool_calls);
+                    let message = failure.to_string();
+                    self.emit_run_failed(ErrorCode("max_tool_calls".into()), false, &message);
                     self.append(SessionEntry::RunFailed {
                         code: ErrorCode("max_tool_calls".into()),
                         retryable: false,
-                        message: failure.to_string(),
+                        message,
                         timestamp: Timestamp::now(),
                     })
                     .await?;
@@ -764,10 +801,12 @@ impl Agent {
             return Ok(event);
         }
         let failure = AgentError::MaxTurnsExceeded(self.config.max_turns);
+        let message = failure.to_string();
+        self.emit_run_failed(ErrorCode("max_turns".into()), false, &message);
         self.append(SessionEntry::RunFailed {
             code: ErrorCode("max_turns".into()),
             retryable: false,
-            message: failure.to_string(),
+            message,
             timestamp: Timestamp::now(),
         })
         .await?;
