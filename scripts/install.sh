@@ -191,6 +191,52 @@ install_packages() {
   esac
 }
 
+# Scan all required tools and print a dependency table.
+# Sets global arrays: _dep_names, _dep_status, _dep_paths
+# Also sets: _need_rust (0 or 1), _missing_system_pkgs (array)
+scan_dependencies() {
+  _dep_names=()
+  _dep_status=()
+  _dep_paths=()
+  _need_rust=0
+  _missing_system_pkgs=()
+
+  for tool in git curl make cargo rustc; do
+    _dep_names+=("$tool")
+    if have "$tool"; then
+      _dep_status+=("ok")
+      _dep_paths+=("$(command -v "$tool")")
+    else
+      _dep_status+=("missing")
+      _dep_paths+=("")
+      if [ "$tool" = "cargo" ] || [ "$tool" = "rustc" ]; then
+        _need_rust=1
+      else
+        _missing_system_pkgs+=("$tool")
+      fi
+    fi
+  done
+}
+
+# Pretty-print the dependency scan table.
+print_dep_table() {
+  echo "dependency check:"
+  for i in "${!_dep_names[@]}"; do
+    local name="${_dep_names[$i]}"
+    local status="${_dep_status[$i]}"
+    local path="${_dep_paths[$i]}"
+    if [ "$status" = "ok" ]; then
+      printf "  %-8s ✓ %s\n" "$name" "$path"
+    else
+      local hint=""
+      if [ "$name" = "cargo" ] || [ "$name" = "rustc" ]; then
+        hint=" (will install Rust ${rust_toolchain} via rustup)"
+      fi
+      printf "  %-8s ✗ missing%s\n" "$name" "$hint"
+    fi
+  done
+}
+
 # Install Rust via rustup. Uses curl (which we ensured above).
 install_rust() {
   # Pre-flight: rustup-init needs to extract the rustup-init binary
@@ -235,37 +281,51 @@ install_rust() {
 
 # --- bootstrap ---------------------------------------------------------------
 if [ "$bootstrap" = "1" ]; then
-  # Step 1: install curl first because rustup needs it.
-  install_packages curl
-  if ! have curl; then
-    echo "install.sh: 'curl' is required but could not be auto-installed." >&2
-    echo "  Install curl manually (e.g. apt install curl / brew install curl)" >&2
-    echo "  and re-run this script." >&2
+  # 1) Scan once, upfront.
+  scan_dependencies
+  print_dep_table
+
+  # 2) One package-manager transaction for all missing system tools.
+  if [ ${#_missing_system_pkgs[@]} -gt 0 ]; then
+    install_packages "${_missing_system_pkgs[@]}"
+    # Re-check after install.
+    for pkg in "${_missing_system_pkgs[@]}"; do
+      if ! have "$pkg"; then
+        echo "install.sh: '$pkg' is required but could not be auto-installed." >&2
+        echo "  Install it manually and re-run this script (or pass --no-bootstrap)." >&2
+        exit 1
+      fi
+    done
+  fi
+
+  # 3) Rustup last — only after system tools are confirmed.
+  if [ "$_need_rust" -eq 1 ]; then
+    # Source env if rustup already exists but cargo isn't on PATH.
+    if [ -x "$HOME/.cargo/bin/rustup" ]; then
+      echo "install.sh: sourcing existing rustup env"
+      # shellcheck disable=SC1091
+      . "$HOME/.cargo/env"
+    else
+      install_rust
+    fi
+  fi
+elif [ "$bootstrap" = "0" ]; then
+  # --no-bootstrap: scan + report, exit if anything missing.
+  scan_dependencies
+  print_dep_table
+  missing=()
+  for i in "${!_dep_status[@]}"; do
+    if [ "${_dep_status[$i]}" = "missing" ]; then
+      missing+=("${_dep_names[$i]}")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "" >&2
+    echo "install.sh: --no-bootstrap but required tools missing: ${missing[*]}" >&2
+    echo "  Install them manually and re-run." >&2
     exit 1
   fi
-
-  # Step 2: install Rust if missing. This is the biggest win — most
-  # users won't have cargo on a fresh box.
-  #
-  # We check in this order:
-  #   a) ~/.cargo/bin/rustup exists           -> source env, skip bootstrap
-  #                                              (rustup is already installed; just
-  #                                              make sure cargo is on PATH)
-  #   b) cargo + rustc both on PATH              -> nothing to do
-  #   c) cargo or rustc missing                 -> install rustup non-interactively
-  #                                              with retries
-  if [ -x "$HOME/.cargo/bin/rustup" ]; then
-    echo "install.sh: rustup already installed at ~/.cargo/bin/rustup; reusing"
-    # shellcheck disable=SC1091
-    . "$HOME/.cargo/env"
-  elif have cargo && have rustc; then
-    echo "install.sh: cargo + rustc on PATH; no bootstrap needed"
-  else
-    install_rust
-  fi
-
-  # Step 3: install git and make (and curl is now confirmed above).
-  install_packages git make
+  echo "install.sh: all dependencies satisfied"
 fi
 
 # --- final tool check ---------------------------------------------------------
@@ -279,22 +339,7 @@ if [ ${#missing[@]} -gt 0 ]; then
   echo "" >&2
   echo "install.sh: required tools still missing after bootstrap: ${missing[*]}" >&2
   echo "" >&2
-  echo "  Install them manually, then re-run this script (or pass --no-bootstrap" >&2
-  echo "  to suppress auto-install entirely)." >&2
-  echo "" >&2
-  case "$uname_s" in
-    Linux)
-      echo "  Linux: 'sudo apt-get install git make curl' (Debian/Ubuntu)" >&2
-      echo "         'sudo dnf install git make curl'    (Fedora/RHEL)" >&2
-      echo "         'sudo pacman -S git make curl'      (Arch)" >&2
-      ;;
-    Darwin)
-      echo "  macOS: 'xcode-select --install'              (Apple toolchain + git)" >&2
-      echo "         'brew install make curl'              (or use Xcode CLT)" >&2
-      ;;
-  esac
-  echo "" >&2
-  echo "  For Rust on any platform: see https://rustup.rs" >&2
+  echo "  Install them manually, then re-run this script (or pass --no-bootstrap)." >&2
   exit 1
 fi
 
