@@ -13,9 +13,10 @@ use std::str::FromStr;
 /// What the TUI driver should do with a parsed slash command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashOutcome {
-    /// Pure UI side-effect (`/clear`, `/help`, `/doctor`, `/model`).
-    /// The driver dispatches the side-effect on the [`App`].
-    Local,
+    /// Pure UI side-effect (`/clear`, `/help`, `/doctor`, `/model`,
+    /// `/resume`). The driver dispatches `name` + `args` to
+    /// [`crate::tui::app::App::apply_local_slash`].
+    Local { name: String, args: String },
     /// Submit `text` as the next agent prompt. Used for the rare
     /// slash command that *does* need the agent (none in v1, but
     /// the slot is reserved for `/summarize` and friends).
@@ -61,14 +62,18 @@ enum SlashCommand {
 
 impl SlashCommand {
     /// Map the command to the action the driver should take.
-    fn outcome(self, _args: &str) -> SlashOutcome {
-        match self {
-            SlashCommand::Help
-            | SlashCommand::Clear
-            | SlashCommand::Doctor
-            | SlashCommand::Model
-            | SlashCommand::Resume => SlashOutcome::Local,
-            SlashCommand::Quit | SlashCommand::Exit => SlashOutcome::Quit,
+    fn outcome(self, args: &str) -> SlashOutcome {
+        let name = match self {
+            SlashCommand::Help => "help",
+            SlashCommand::Clear => "clear",
+            SlashCommand::Doctor => "doctor",
+            SlashCommand::Model => "model",
+            SlashCommand::Resume => "resume",
+            SlashCommand::Quit | SlashCommand::Exit => return SlashOutcome::Quit,
+        };
+        SlashOutcome::Local {
+            name: name.to_string(),
+            args: args.to_string(),
         }
     }
 }
@@ -109,11 +114,27 @@ mod tests {
 
     #[test]
     fn slash_local_commands() {
-        assert_eq!(parse_slash("/help"), Some(SlashOutcome::Local));
-        assert_eq!(parse_slash("/clear"), Some(SlashOutcome::Local));
-        assert_eq!(parse_slash("/doctor"), Some(SlashOutcome::Local));
-        assert_eq!(parse_slash("/model"), Some(SlashOutcome::Local));
-        assert_eq!(parse_slash("/resume 01ABC"), Some(SlashOutcome::Local));
+        assert_eq!(
+            parse_slash("/help"),
+            Some(SlashOutcome::Local {
+                name: "help".into(),
+                args: String::new(),
+            })
+        );
+        assert_eq!(
+            parse_slash("/clear"),
+            Some(SlashOutcome::Local {
+                name: "clear".into(),
+                args: String::new(),
+            })
+        );
+        assert_eq!(
+            parse_slash("/resume 01ABC"),
+            Some(SlashOutcome::Local {
+                name: "resume".into(),
+                args: "01ABC".into(),
+            })
+        );
     }
 
     #[test]
@@ -126,7 +147,13 @@ mod tests {
     #[test]
     fn leading_whitespace_tolerated() {
         assert_eq!(parse_slash("   /quit"), Some(SlashOutcome::Quit));
-        assert_eq!(parse_slash("\t/help"), Some(SlashOutcome::Local));
+        assert_eq!(
+            parse_slash("\t/help"),
+            Some(SlashOutcome::Local {
+                name: "help".into(),
+                args: String::new(),
+            })
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::event::{AgentEvent, StopReason, ToolStream};
 use crate::ids::{SessionId, ToolCallId};
 use crate::message::Part;
+use crate::tui::picker::{PickerEntry, SessionPicker};
 
 /// Top-level TUI model.
 #[derive(Debug)] // satisfy the missing_debug_implementations crate-wide lint
@@ -84,6 +85,16 @@ pub struct App {
     /// `ToolOutput` appends, `ToolFinished` closes and emits the
     /// final `ChatEntry::ToolCard`.
     in_flight_tools: std::collections::HashMap<ToolCallId, PendingTool>,
+
+    /// Session picker overlay, when open. `None` while the user is
+    /// editing the composer. Opened by `/resume` (no args); the
+    /// driver sets [`App::pending_resume`] when the user picks one.
+    pub picker: Option<SessionPicker>,
+
+    /// Session id the user just selected from the picker. The TUI
+    /// driver reads this on the way out and prints a resume
+    /// command; future slices may rebuild the agent in place.
+    pub pending_resume: Option<String>,
 }
 
 impl App {
@@ -112,6 +123,8 @@ impl App {
             last_tick: Instant::now(),
             model_label: config.model.clone(),
             in_flight_tools: std::collections::HashMap::new(),
+            picker: None,
+            pending_resume: None,
         };
         for msg in history {
             replay_message(&mut app, msg);
@@ -324,6 +337,12 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        // Picker overlay has its own keymap. When the picker is
+        // open, ONLY picker keys apply — the composer is inert.
+        if self.picker.is_some() {
+            return self.handle_picker_key(code, modifiers);
+        }
+
         // Global shortcuts (always active).
         match (code, modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -387,9 +406,94 @@ impl App {
         true
     }
 
+    /// Keymap for the session picker overlay.
+    fn handle_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        // Ctrl+C bails the picker AND quits — the user should
+        // always be able to recover from an unexpected overlay.
+        if (code, modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL) {
+            self.picker = None;
+            self.quit = true;
+            return true;
+        }
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.picker = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.select_next();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.select_prev();
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.page_down(10);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.page_up(10);
+                }
+            }
+            KeyCode::Home => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.select_first();
+                }
+            }
+            KeyCode::End => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.select_last();
+                }
+            }
+            KeyCode::Enter => {
+                // Capture the selected id, close the picker, signal
+                // the driver to exit so it can print the resume
+                // command. Building the full command is the
+                // driver's job (it owns argv).
+                if let Some(p) = self.picker.take() {
+                    if let Some(entry) = p.selected() {
+                        self.pending_resume = Some(entry.session_id.clone());
+                    }
+                }
+                self.quit = true;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Open the session picker with `entries`. Replaces any
+    /// previously-open picker.
+    pub fn open_picker(&mut self, entries: Vec<PickerEntry>) {
+        self.picker = Some(SessionPicker::new(entries));
+    }
+
+    /// Drop the picker overlay without selecting anything.
+    pub fn close_picker(&mut self) {
+        self.picker = None;
+    }
+
+    /// True if the picker overlay is currently visible.
+    #[must_use]
+    pub fn picker_is_open(&self) -> bool {
+        self.picker.is_some()
+    }
+
     /// Apply the side-effects of a parsed slash command (already
     /// classified by [`crate::tui::commands::parse_slash`]).
-    pub fn apply_local_slash(&mut self, name: &str, _args: &str) {
+    ///
+    /// Most commands are sync UI effects (clear, help, doctor,
+    /// model). `/resume` is special — it requires async I/O to
+    /// load the sessions directory, so the driver handles it
+    /// separately before invoking this method. When this method
+    /// is called for `resume`, the driver has already either
+    /// opened the picker or pushed a status line explaining why
+    /// it can't.
+    pub fn apply_local_slash(&mut self, name: &str, args: &str) {
         match name {
             "clear" => {
                 self.history.clear();
@@ -409,6 +513,21 @@ impl App {
                     "current model: {}",
                     self.model_label
                 )));
+            }
+            "resume" => {
+                // The driver should have intercepted this before we
+                // got here. If we somehow land here (e.g. from a
+                // future caller), surface a hint so the user is not
+                // left wondering why nothing happened.
+                if args.is_empty() {
+                    self.history.push(ChatEntry::StatusLine(
+                        "resume: pick a session with the picker overlay".to_string(),
+                    ));
+                } else {
+                    self.history.push(ChatEntry::StatusLine(format!(
+                        "resume: use `crow tui --resume {args}` from the shell"
+                    )));
+                }
             }
             _ => {}
         }

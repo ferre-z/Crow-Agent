@@ -53,6 +53,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_chat(frame, chunks[1], app);
     draw_input(frame, chunks[2], app);
     draw_status(frame, chunks[3], app);
+
+    // Overlays paint last so they sit on top of the regular layout.
+    if app.picker_is_open() {
+        draw_session_picker(frame, area, app);
+    }
 }
 
 /// Top header: model name, session path tail. Single-line.
@@ -271,4 +276,113 @@ fn short_path(p: &std::path::Path) -> String {
 /// 8 is plenty for collision-free identification in the status bar).
 fn short_session_id(id: &crate::ids::SessionId) -> String {
     id.0.to_string().chars().take(8).collect()
+}
+
+/// Render the session picker overlay as a centered modal.
+fn draw_session_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let picker = match app.picker.as_mut() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Modal sizing: ~70% width, up to ~60% height, minimum 40x12 so
+    // the title and footer always fit.
+    let popup_w = (area.width as u32 * 7 / 10).max(40) as u16;
+    let popup_h = (area.height as u32 * 6 / 10).max(12) as u16;
+    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
+    let block = Block::default()
+        .title(" Resume a session ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // header line
+            Constraint::Min(1),    // session list
+            Constraint::Length(1), // footer / hints
+        ])
+        .split(inner);
+
+    // Header: count of sessions.
+    let header_line = Line::from(vec![
+        Span::styled(
+            format!(" {} session(s) ", picker.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw("    "),
+        Span::styled(
+            "↑/↓ move · Enter select · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(header_line), rows[0]);
+
+    // Body: list of sessions, highlight the selected row, scroll
+    // so the highlight is in view.
+    let viewport = rows[1].height as usize;
+    picker.ensure_visible(viewport);
+    let scroll = picker.scroll();
+    let selected = picker.selected_index();
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let end = (scroll + viewport).min(picker.len());
+    for (row_index, entry_index) in (scroll..end).enumerate() {
+        let Some(entry) = picker.get(entry_index) else {
+            continue;
+        };
+        let is_selected = entry_index == selected;
+        let marker = if is_selected { " ▸ " } else { "   " };
+        let marker_style = if is_selected {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let id_style = if is_selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mut line_spans = vec![
+            Span::styled(marker.to_string(), marker_style),
+            Span::styled(entry.session_id.clone(), id_style),
+            Span::styled(
+                format!("  {} ", entry.started_at),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        if !entry.path_tail.is_empty() {
+            line_spans.push(Span::styled(
+                entry.path_tail.clone(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        // Highlight the entire row by tinting the background when
+        // selected. ratatui's Paragraph doesn't per-line background,
+        // so we approximate with a leading bullet and bolding.
+        body.push(Line::from(line_spans));
+        let _ = row_index; // silence unused
+    }
+    let list = Paragraph::new(body);
+    frame.render_widget(list, rows[1]);
+
+    // Footer: hint that the picker exits on selection.
+    let footer = Line::from(vec![Span::styled(
+        " Enter prints `crow tui --resume <id>` and exits ",
+        Style::default().fg(Color::DarkGray),
+    )]);
+    frame.render_widget(Paragraph::new(footer), rows[2]);
 }

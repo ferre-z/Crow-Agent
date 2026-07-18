@@ -31,6 +31,7 @@
 pub mod app;
 pub mod commands;
 pub mod markdown;
+pub mod picker;
 pub mod tools;
 pub mod ui;
 
@@ -56,6 +57,7 @@ use crate::session::{self, SessionWriter};
 
 pub use app::{App, InputMode, Overlay, RunPhase};
 pub use commands::{parse_slash, SlashOutcome};
+pub use picker::{PickerEntry, SessionPicker};
 
 /// Entry point invoked from the `crow tui` subcommand.
 ///
@@ -225,7 +227,24 @@ async fn run_inner(
                                     let _ = prompt_tx.send(text).await;
                                 }
                                 SlashOutcome::Quit => break,
-                                SlashOutcome::Local => {}
+                                SlashOutcome::Local { name, args } => {
+                                    // `/resume` is special: it needs
+                                    // async I/O to list the sessions
+                                    // directory, so the driver loads
+                                    // the entries and either opens
+                                    // the picker or pushes a status
+                                    // line explaining why it can't.
+                                    if name == "resume" && args.is_empty() {
+                                        if let Err(e) =
+                                            open_session_picker(&mut app, &config).await
+                                        {
+                                            app.apply_local_slash("resume", "");
+                                            let _ = e; // apply_local_slash already explained
+                                        }
+                                    } else {
+                                        app.apply_local_slash(&name, &args);
+                                    }
+                                }
                             }
                             needs_redraw = true;
                             continue;
@@ -254,7 +273,91 @@ async fn run_inner(
     cancel.cancel();
     drop(prompt_tx);
     let _ = worker_handle.await;
+
+    // If the user picked a session from the overlay, emit a
+    // copy-pasteable resume command on stdout. We print AFTER the
+    // terminal is restored in `run` so the line lands on the
+    // user's normal prompt, not inside the alt-screen.
+    if let Some(id) = app.pending_resume.as_deref() {
+        println!("Resume with: crow tui --resume {id}");
+    }
     Ok(())
+}
+
+/// Load every session in the project's sessions directory and
+/// open the picker overlay on `app`.
+///
+/// On any error (missing dir, I/O failure) the caller falls back
+/// to `apply_local_slash("resume", "")` which surfaces a
+/// human-readable status line. We deliberately do NOT propagate
+/// the error — picker failure is a UX hiccup, not a crash.
+async fn open_session_picker(app: &mut App, config: &crate::config::Config) -> anyhow::Result<()> {
+    let dir = sessions_dir_for(config);
+    if !dir.exists() {
+        anyhow::bail!("sessions directory does not exist");
+    }
+    let metas = session::list_sessions(&dir).await?;
+    if metas.is_empty() {
+        anyhow::bail!("no sessions to resume");
+    }
+    let entries: Vec<PickerEntry> = metas
+        .into_iter()
+        .take(50) // cap the list so a thousand-session repo stays snappy
+        .map(|m| PickerEntry {
+            session_id: m.session_id.0.to_string(),
+            started_at: format_timestamp(m.started_at),
+            path_tail: short_path_for_picker(&m.path),
+        })
+        .collect();
+    app.open_picker(entries);
+    Ok(())
+}
+
+/// Shorten a session log path so it fits inside the picker row.
+/// Mirrors `ui::short_path` but lives here to avoid a UI dep on
+/// the driver module's private helpers.
+fn short_path_for_picker(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    let max = 40;
+    if s.len() <= max {
+        s
+    } else {
+        format!("…{}", &s[s.len() - (max - 1)..])
+    }
+}
+
+/// Format a [`Timestamp`] as `YYYY-MM-DDTHH:MM:SSZ` for the picker
+/// row. Mirrors `cli::format_timestamp` but is private to the TUI
+/// module so we don't leak CLI plumbing through the public API.
+fn format_timestamp(ts: crate::ids::Timestamp) -> String {
+    let dur =
+        ts.0.duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+    epoch_to_civil(dur.as_secs())
+}
+
+/// Howard Hinnant's date algorithm. Duplicated from `cli.rs` so the
+/// TUI can format timestamps without depending on the CLI module.
+fn epoch_to_civil(secs: u64) -> String {
+    let (year, month, day, hour, minute, second) = {
+        let days = (secs / 86_400) as i64;
+        let rem = secs % 86_400;
+        let hour = (rem / 3600) as u32;
+        let minute = ((rem % 3600) / 60) as u32;
+        let second = (rem % 60) as u32;
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        let year = (if m <= 2 { y + 1 } else { y }) as i32;
+        (year, m, d, hour, minute, second)
+    };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Worker task: owns the agent and runs the loop.
