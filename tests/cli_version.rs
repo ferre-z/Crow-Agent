@@ -42,3 +42,22 @@ fn version_subcommand_exits_zero() {
         .assert()
         .success();
 }
+
+#[test]
+fn exec_help_describes_output_format_flag() {
+    Command::cargo_bin("crow")
+        .unwrap()
+        .args(["exec", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--output-format"));
+}
+
+#[test]
+fn exec_rejects_unknown_output_format() {
+    Command::cargo_bin("crow")
+        .unwrap()
+        .args(["exec", "--output-format", "yaml", "hi"])
+        .assert()
+        .failure();
+}

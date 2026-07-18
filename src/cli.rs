@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +21,19 @@ use crate::provider::mock::ScriptedProvider;
 use crate::provider::Provider;
 use crate::session::{self, SessionMeta};
 use crate::tool::{BashTool, EditTool, ReadTool, ToolRegistry, WriteTool};
+
+/// Output format for `crow exec`. `Text` matches the default
+/// Claude Code / opencode behaviour: only the final assistant
+/// message is printed. `StreamJson` emits every kernel event as
+/// a JSON line so CI pipelines can consume the full transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Print only the final assistant message on stdout.
+    Text,
+    /// Emit one JSON line per [`AgentEvent`] plus a final assistant
+    /// message line, suitable for `jq` / CI / log aggregation.
+    StreamJson,
+}
 
 /// Command-line arguments parsed by clap.
 #[derive(Debug, Parser)]
@@ -54,10 +67,20 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run a one-shot prompt against the agent loop and print the
-    /// final assistant message.
+    /// final assistant message. With `--output-format stream-json`
+    /// the kernel emits one JSON line per [`crate::event::AgentEvent`]
+    /// plus a final assistant message on stdout, suitable for
+    /// piping into CI scripts or `jq`.
     Exec {
         /// Prompt text to send.
         prompt: String,
+        /// Output format. `text` (default) prints only the final
+        /// assistant message. `stream-json` emits every kernel
+        /// event as a JSON line plus the final assistant message
+        /// as a separate line — same wire format Claude Code uses
+        /// for `-p --output-format stream-json`.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
     },
     /// List every session in the active project's sessions directory,
     /// newest first.
@@ -139,7 +162,10 @@ pub async fn run(args: Cli) -> Result<()> {
         .context("loading config")?;
     let resume_id = args.resume.clone();
     match args.command {
-        Command::Exec { prompt } => exec(&config, resume_id.as_deref(), prompt).await,
+        Command::Exec {
+            prompt,
+            output_format,
+        } => exec(&config, resume_id.as_deref(), prompt, output_format).await,
         Command::Sessions => sessions(&config).await,
         Command::Resume { session_id, prompt } => resume(&config, session_id, prompt).await,
         Command::Doctor { live } => doctor(&config, live).await,
@@ -169,7 +195,12 @@ pub async fn run(args: Cli) -> Result<()> {
     }
 }
 
-async fn exec(config: &Config, resume_id: Option<&str>, prompt: String) -> Result<()> {
+async fn exec(
+    config: &Config,
+    resume_id: Option<&str>,
+    prompt: String,
+    output_format: OutputFormat,
+) -> Result<()> {
     let provider = build_provider(config)?;
     let tools = default_registry();
     let sessions_dir = sessions_dir_for(config);
@@ -178,13 +209,64 @@ async fn exec(config: &Config, resume_id: Option<&str>, prompt: String) -> Resul
         .context("creating sessions directory")?;
     let session_path = new_session_path(&sessions_dir);
 
-    // Resume if a session id was provided.
     let cancel = CancellationToken::new();
     let user_msg = Message {
         id: crate::ids::MessageId(crate::ids::new_id()),
         role: Role::User,
         parts: vec![Part::Text { text: prompt }],
     };
+
+    if output_format == OutputFormat::StreamJson {
+        let path = if let Some(session_id) = resume_id {
+            resolve_session_id(&sessions_dir, session_id)
+                .await
+                .with_context(|| format!("resolving session id {session_id}"))?
+        } else {
+            session_path.clone()
+        };
+        let writer = session::SessionWriter::open(&path)
+            .await
+            .with_context(|| format!("opening session log {path:?}"))?;
+        let cfg = AgentConfig::new(
+            config.max_turns,
+            config.max_tool_calls,
+            config.model.clone(),
+            config.project_root.clone(),
+            writer,
+        );
+        let sink: Arc<dyn crate::event::AgentEventSink> = Arc::new(StreamJsonSink);
+        let mut agent = if resume_id.is_some() {
+            let (agent, _history) = Agent::resume_into(
+                cfg,
+                Arc::clone(&provider) as Arc<dyn Provider>,
+                tools,
+                cancel,
+                sink,
+                &path,
+            )
+            .await
+            .context("rebuilding session")?;
+            agent
+        } else {
+            Agent::with_sink(
+                cfg,
+                Arc::clone(&provider) as Arc<dyn Provider>,
+                tools,
+                cancel,
+                Vec::new(),
+                sink,
+            )
+        };
+        let final_event = agent.submit(user_msg).await.context("agent loop")?;
+        if let crate::event::AgentEvent::RunFinished { message } = final_event {
+            println!(
+                "{}",
+                serde_json::json!({"type": "AssistantMessage", "text": message})
+            );
+        }
+        return Ok(());
+    }
+
     let mut agent = if let Some(session_id) = resume_id {
         let path = resolve_session_id(&sessions_dir, session_id)
             .await
@@ -214,7 +296,7 @@ async fn exec(config: &Config, resume_id: Option<&str>, prompt: String) -> Resul
     } else {
         let writer = session::SessionWriter::open(&session_path)
             .await
-            .context("opening session log")?;
+            .with_context(|| format!("opening session log {session_path:?}"))?;
         let cfg = AgentConfig::new(
             config.max_turns,
             config.max_tool_calls,
@@ -236,6 +318,19 @@ async fn exec(config: &Config, resume_id: Option<&str>, prompt: String) -> Resul
         println!("{message}");
     }
     Ok(())
+}
+
+/// `AgentEventSink` that writes every kernel event as a JSON line
+/// on stdout. Used by `crow exec --output-format stream-json` for
+/// CI pipelines that want to consume the full transcript.
+struct StreamJsonSink;
+
+impl crate::event::AgentEventSink for StreamJsonSink {
+    fn on_event(&self, event: crate::event::AgentEvent) {
+        if let Ok(line) = serde_json::to_string(&event) {
+            println!("{line}");
+        }
+    }
 }
 
 async fn sessions(config: &Config) -> Result<()> {
@@ -303,7 +398,7 @@ fn epoch_to_civil(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
 }
 
 async fn resume(config: &Config, session_id: String, prompt: String) -> Result<()> {
-    exec(config, Some(&session_id), prompt).await
+    exec(config, Some(&session_id), prompt, OutputFormat::Text).await
 }
 
 async fn doctor(config: &Config, live: bool) -> Result<()> {
