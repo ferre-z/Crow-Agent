@@ -40,7 +40,21 @@ impl GenaiProvider {
     #[must_use]
     /// Build a provider using an explicit API key.
     pub fn with_api_key(base_url: &str, model: &str, api_key: String) -> Self {
-        let endpoint = Endpoint::from_owned(base_url.to_owned());
+        // The genai 0.6.5 adapter builds the full URL with
+        // `reqwest::Url::join("chat/completions")`. When the
+        // configured base URL is missing a trailing slash (e.g.
+        // `https://integrate.api.nvidia.com/v1`), `Url::join`
+        // REPLACES the last path segment instead of appending, so
+        // the request lands on `/chat/completions` (404) instead of
+        // `/v1/chat/completions`. We normalise here so any
+        // OpenAI-compatible endpoint works without per-vendor
+        // config.
+        let normalised = if base_url.ends_with('/') {
+            base_url.to_owned()
+        } else {
+            format!("{base_url}/")
+        };
+        let endpoint = Endpoint::from_owned(normalised);
         let auth = AuthData::from_single(api_key);
         let resolver = ServiceTargetResolver::from_resolver_fn(
             move |target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {

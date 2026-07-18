@@ -18,8 +18,12 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use thiserror::Error;
 
-/// Default model to use when no override is given.
-pub const DEFAULT_MODEL: &str = "MiniMax M3";
+/// Default model to use when no override is given. Nemotron 3 Ultra
+/// is the project's primary reasoning model: a 550B-parameter
+/// Mixture-of-Experts (55B active) NVIDIA-built open-weights
+/// model, served on the NVIDIA catalog. Override via `CROW_MODEL`
+/// env or `--model` CLI flag.
+pub const DEFAULT_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b";
 /// Default base URL for the OpenAI-compatible endpoint.
 pub const DEFAULT_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 /// Default environment variable name holding the API key.

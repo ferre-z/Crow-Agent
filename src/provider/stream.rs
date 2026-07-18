@@ -221,15 +221,36 @@ impl StreamAccumulator {
                 } = self.pending.remove(entry);
                 // Parse the concatenated JSON. An empty `args_buf` is
                 // treated as `Null` (test 4 in the brief).
+                //
+                // Some providers (notably NVIDIA's Nemotron and
+                // other OpenAI-compatible endpoints) emit
+                // `function.arguments` as a JSON-escaped string
+                // rather than an object, so the streaming layer
+                // sees `Value::String("{\"command\":\"...\"}")`. A
+                // single `serde_json::from_str` round-trip would
+                // then return `Value::String`, which downstream
+                // tools reject with "is not of type 'object'". We
+                // detect that case and re-parse once more so
+                // double-encoded arguments resolve to the right
+                // shape without provider-specific shims.
                 let args = if args_buf.trim().is_empty() {
                     serde_json::Value::Null
                 } else {
-                    serde_json::from_str(&args_buf).map_err(|e| {
-                        StreamError::Invalid(format!(
-                            "tool call {} arguments are not valid JSON: {e}",
-                            call_id.0
-                        ))
-                    })?
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&args_buf).map_err(|e| {
+                            StreamError::Invalid(format!(
+                                "tool call {} arguments are not valid JSON: {e}",
+                                call_id.0
+                            ))
+                        })?;
+                    match parsed {
+                        serde_json::Value::String(ref inner)
+                            if inner.trim_start().starts_with('{') =>
+                        {
+                            serde_json::from_str(inner).unwrap_or(parsed)
+                        }
+                        other => other,
+                    }
                 };
                 Ok(vec![AgentEvent::ToolStarted {
                     call_id,
