@@ -317,8 +317,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Style::default().fg(Color::Green),
     ));
     spans.push(Span::raw("    "));
+    let session_label = match &app.session_name {
+        Some(name) => format!("session {name} ({})", short_session_id(&app.session_id)),
+        None => format!("session {}", short_session_id(&app.session_id)),
+    };
     spans.push(Span::styled(
-        format!("session {}", short_session_id(&app.session_id)),
+        session_label,
         Style::default().fg(Color::DarkGray),
     ));
     spans.push(Span::raw("    "));

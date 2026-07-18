@@ -73,6 +73,7 @@ pub async fn run(
     _project_root: PathBuf,
     plan_mode: bool,
     no_color: bool,
+    name: Option<String>,
 ) -> Result<()> {
     // Set up the terminal. Raw mode + alternate screen so the user's
     // shell history is untouched on exit.
@@ -87,7 +88,7 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
 
-    let result = run_inner(&mut terminal, config, resume, plan_mode, no_color).await;
+    let result = run_inner(&mut terminal, config, resume, plan_mode, no_color, name).await;
 
     // Always restore the terminal, even on error, so the user is not
     // left staring at a broken prompt.
@@ -107,6 +108,7 @@ async fn run_inner(
     resume: Option<String>,
     plan_mode: bool,
     no_color: bool,
+    name: Option<String>,
 ) -> Result<()> {
     // Build the provider. We do this here (before any TUI drawing)
     // so credential errors surface as a clean stderr message rather
@@ -192,12 +194,25 @@ async fn run_inner(
     let worker_handle = tokio::spawn(worker_loop(agent, prompt_rx, cancel_for_worker));
 
     // App model + replay resumed history into the chat view.
+    // The optional friendly label (F.40.04) is set via
+    // `crow tui --name <label>` at startup. On resume we keep the
+    // existing label if there is one; on a fresh session we use
+    // the user-supplied label directly.
+    let resolved_name = match (&resume, name) {
+        (Some(_), _) => load_session_name(&session_path),
+        (None, Some(label)) => {
+            save_session_name(&session_path, &label);
+            Some(label)
+        }
+        (None, None) => None,
+    };
     let mut app = App::new(
         config.clone(),
         session_path.clone(),
         initial_history.clone(),
         plan_mode,
         no_color,
+        resolved_name,
     );
 
     // Main loop. We poll three sources:
@@ -358,6 +373,56 @@ fn short_path_for_picker(p: &std::path::Path) -> String {
         s
     } else {
         format!("…{}", &s[s.len() - (max - 1)..])
+    }
+}
+
+/// Sidecar file mapping session id (derived from the JSONL filename)
+/// to a friendly label. Lives in `<project>/.crow/session-names.json`.
+/// One file per project keeps the labels scoped.
+const NAMES_FILE: &str = "session-names.json";
+
+/// Look up the friendly label for a session, if one is recorded.
+/// Returns `None` on any I/O or parse error — labels are cosmetic.
+fn load_session_name(session_path: &std::path::Path) -> Option<String> {
+    let id = session_path
+        .file_stem()
+        .and_then(|s| s.to_str())?
+        .to_string();
+    load_session_name_for_id(&id, session_path.parent()?)
+}
+
+/// Look up the friendly label for `session_id` given the sessions
+/// directory it lives in. Used by the picker overlay to render the
+/// label next to the ULID.
+pub fn load_session_name_for_id(
+    session_id: &str,
+    sessions_dir: &std::path::Path,
+) -> Option<String> {
+    let path = sessions_dir.join(NAMES_FILE);
+    let bytes = std::fs::read_to_string(&path).ok()?;
+    let map: std::collections::HashMap<String, String> = serde_json::from_str(&bytes).ok()?;
+    map.get(session_id).cloned()
+}
+
+/// Persist a friendly label for a session. Best-effort: I/O or
+/// parse failures are logged but not surfaced to the user.
+fn save_session_name(session_path: &std::path::Path, label: &str) {
+    let Some(id) = session_path.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let Some(dir) = session_path.parent() else {
+        return;
+    };
+    let path = dir.join(NAMES_FILE);
+    let mut map: std::collections::HashMap<String, String> = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => std::collections::HashMap::new(),
+    };
+    map.insert(id.to_string(), label.to_string());
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        if let Err(e) = std::fs::write(&path, json) {
+            tracing::warn!("failed to write {}: {e}", path.display());
+        }
     }
 }
 

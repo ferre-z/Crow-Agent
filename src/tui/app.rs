@@ -157,6 +157,11 @@ pub struct App {
     /// against cwd). The list grows as the user runs `/add-dir`.
     pub allowed_extra_dirs: Vec<std::path::PathBuf>,
 
+    /// Optional friendly label for this session (F.40.04). Set via
+    /// `crow tui --name <label>` or auto-set on the first prompt
+    /// (F.40.05). `None` means "no label; show the ULID".
+    pub session_name: Option<String>,
+
     /// Plan mode flag. When true, the agent only has `read`
     /// available — it can inspect code but cannot mutate files
     /// or run shell commands. Set at startup from the `--plan`
@@ -181,6 +186,7 @@ impl App {
         history: Vec<crate::message::Message>,
         plan_mode: bool,
         no_color: bool,
+        session_name: Option<String>,
     ) -> Self {
         // Pricing lives at <repo>/config/pricing.toml. We resolve
         // it relative to the config's project_root so users can
@@ -242,6 +248,7 @@ impl App {
             pricing,
             cumulative_cost_usd: 0.0,
             allowed_extra_dirs: Vec::new(),
+            session_name,
             plan_mode,
             no_color,
         };
@@ -1117,6 +1124,7 @@ mod plan_mode_tests {
             Vec::new(),
             false,
             false,
+            None,
         )
     }
 
@@ -1134,6 +1142,7 @@ mod plan_mode_tests {
             Vec::new(),
             true,
             false,
+            None,
         );
         assert!(app.plan_mode);
     }
@@ -1152,6 +1161,7 @@ mod plan_mode_tests {
             Vec::new(),
             false,
             true,
+            None,
         );
         assert!(app.no_color);
     }

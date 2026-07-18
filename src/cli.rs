@@ -131,6 +131,11 @@ pub enum Command {
         /// attributes are stripped.
         #[arg(long)]
         no_color: bool,
+        /// Optional friendly label for the session (F.40.04). Shown
+        /// in `crow sessions` and the `/resume` picker instead of
+        /// the truncated ULID.
+        #[arg(long, value_name = "LABEL")]
+        name: Option<String>,
     },
     /// Print the version string (same as --version).
     Version,
@@ -182,11 +187,12 @@ pub async fn run(args: Cli) -> Result<()> {
             resume,
             plan,
             no_color,
+            name,
         } => {
             // Project root is taken from the resolved config so the
             // TUI operates on the same directory `crow exec` would.
             let project_root = config.project_root.clone();
-            crate::tui::run(config, resume, project_root, plan, no_color).await
+            crate::tui::run(config, resume, project_root, plan, no_color, name).await
         }
         Command::Version => {
             println!("crow {}", env!("CARGO_PKG_VERSION"));
