@@ -83,6 +83,10 @@ pub struct App {
     /// Model display string for the status bar.
     pub model_label: String,
 
+    /// When this TUI session was started (UTC ISO-8601). Surfaced
+    /// by the `/status` slash command (F.10.15).
+    pub started_at: String,
+
     /// Buffer of in-flight tool calls by id. `ToolStarted` allocates,
     /// `ToolOutput` appends, `ToolFinished` closes and emits the
     /// final `ChatEntry::ToolCard`.
@@ -194,6 +198,30 @@ impl App {
             quit: false,
             last_tick: Instant::now(),
             model_label: config.model.clone(),
+            started_at: {
+                // Inline ISO-8601 UTC formatter; lives here so app.rs
+                // doesn't depend on private helpers in mod.rs.
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let days = (secs / 86_400) as i64;
+                let rem = secs % 86_400;
+                let hour = (rem / 3600) as u32;
+                let minute = ((rem % 3600) / 60) as u32;
+                let second = (rem % 60) as u32;
+                let z = days + 719_468;
+                let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+                let doe = (z - era * 146_097) as u64;
+                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+                let y = yoe as i64 + era * 400;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+                let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+                let yr = (if m <= 2 { y + 1 } else { y }) as i32;
+                format!("{yr:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+            },
             in_flight_tools: std::collections::HashMap::new(),
             picker: None,
             pending_resume: None,
@@ -657,6 +685,7 @@ impl App {
                 self.toggle_plan_mode();
             }
             "cost" => self.show_cost(),
+            "status" => self.show_status(),
             _ => {}
         }
     }
@@ -685,6 +714,52 @@ impl App {
                 in_t,
                 out_t
             )));
+        }
+    }
+
+    /// F.10.15 — render the `/status` summary: session id, started
+    /// at, current phase, total turns, total tool calls, total
+    /// tokens, total cost. Single screen, no scroll.
+    fn show_status(&mut self) {
+        let total_turns = self
+            .history
+            .iter()
+            .filter(|e| matches!(e, ChatEntry::AssistantText(_)))
+            .count();
+        let total_tool_calls = self
+            .history
+            .iter()
+            .filter(|e| matches!(e, ChatEntry::ToolCard { .. }))
+            .count();
+        let phase = match self.phase {
+            RunPhase::Idle => "idle",
+            RunPhase::Running => "running",
+            RunPhase::Done => "done",
+            RunPhase::Cancelled => "cancelled",
+            RunPhase::Failed => "failed",
+        };
+        let model = self.model_label.clone();
+        let started = self.started_at.clone();
+        let total_in = self.cumulative_input_tokens;
+        let total_out = self.cumulative_output_tokens;
+        let total_cost = self.cumulative_cost_usd;
+        let plan_mode = self.plan_mode;
+        let lines = vec![
+            format!("session:    {}", self.session_id.0),
+            format!("started:    {started}"),
+            format!("phase:      {phase}"),
+            format!("model:      {model}"),
+            format!("plan mode:  {plan_mode}"),
+            format!("turns:      {total_turns}"),
+            format!("tool calls: {total_tool_calls}"),
+            format!("tokens:     in:{total_in} out:{total_out}"),
+            format!(
+                "cost:       {}",
+                crate::provider::pricing::format_usd(total_cost)
+            ),
+        ];
+        for line in lines {
+            self.history.push(ChatEntry::StatusLine(line));
         }
     }
 }
@@ -941,6 +1016,22 @@ impl App {
         self.pending_approval.take()
     }
 
+    /// Reset every per-session accumulator. Called on `--resume <id>`
+    /// so a fresh session starts clean.
+    pub fn reset_session(&mut self) {
+        self.cumulative_input_tokens = 0;
+        self.cumulative_output_tokens = 0;
+        self.cumulative_cost_usd = 0.0;
+        self.per_tool_tokens.clear();
+        self.history.clear();
+        self.allowlist = AllowList::new();
+        self.last_resolution = None;
+        self.current_tool = None;
+        self.current_tool_started_at = None;
+        self.last_error = None;
+        self.pending_approval = None;
+    }
+
     /// Toggle plan mode. The driver routes the user's `/plan`
     /// slash command through here. The current session's tool
     /// registry is not rebuilt mid-flight (the worker task owns
@@ -1160,6 +1251,38 @@ mod plan_mode_tests {
         }
         assert!(found_bash);
         assert!(found_edit);
+    }
+
+    // --- F.10.15 /status tests ---
+
+    #[test]
+    fn status_command_pushes_metadata_lines() {
+        let mut app = make_app();
+        app.cumulative_input_tokens = 1234;
+        app.cumulative_output_tokens = 567;
+        app.cumulative_cost_usd = 0.0123;
+        let before = app.history.len();
+        app.show_status();
+        // 9 lines: session, started, phase, model, plan, turns, tool, tokens, cost
+        assert_eq!(app.history.len() - before, 9);
+        // Spot-check key lines.
+        let all: String = app.history[before..]
+            .iter()
+            .filter_map(|e| {
+                if let ChatEntry::StatusLine(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("session:"));
+        assert!(all.contains("model:"));
+        assert!(all.contains("phase:      idle"));
+        assert!(all.contains("plan mode:  false"));
+        assert!(all.contains("tokens:     in:1234 out:567"));
+        assert!(all.contains("cost:"));
     }
 }
 
