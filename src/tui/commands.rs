@@ -59,6 +59,7 @@ enum SlashCommand {
     Model,
     Resume,
     Plan,
+    Cost,
 }
 
 impl SlashCommand {
@@ -71,6 +72,7 @@ impl SlashCommand {
             SlashCommand::Model => "model",
             SlashCommand::Resume => "resume",
             SlashCommand::Plan => "plan",
+            SlashCommand::Cost => "cost",
             SlashCommand::Quit | SlashCommand::Exit => return SlashOutcome::Quit,
         };
         SlashOutcome::Local {
@@ -92,6 +94,7 @@ impl FromStr for SlashCommand {
             "model" => Self::Model,
             "resume" => Self::Resume,
             "plan" => Self::Plan,
+            "cost" => Self::Cost,
             _ => return Err(()),
         })
     }

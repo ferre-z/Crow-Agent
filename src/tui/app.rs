@@ -656,7 +656,35 @@ impl App {
                 // gets feedback either way.
                 self.toggle_plan_mode();
             }
+            "cost" => self.show_cost(),
             _ => {}
+        }
+    }
+
+    /// F.10.08 — render the `/cost` summary: total USD, total tokens,
+    /// per-tool breakdown. Pushed as a stack of `StatusLine`
+    /// entries so it scrolls naturally with the rest of the chat.
+    fn show_cost(&mut self) {
+        let total = self.cumulative_cost_usd;
+        let total_in = self.cumulative_input_tokens;
+        let total_out = self.cumulative_output_tokens;
+        self.history.push(ChatEntry::StatusLine(format!(
+            "cost: {}  (in:{} out:{})",
+            crate::provider::pricing::format_usd(total),
+            total_in,
+            total_out
+        )));
+        if self.per_tool_tokens.is_empty() {
+            return;
+        }
+        for (tool, (in_t, out_t)) in &self.per_tool_tokens {
+            let usd = self.pricing.cost(&self.model_label, *in_t, *out_t);
+            self.history.push(ChatEntry::StatusLine(format!(
+                "  {tool}: {}  (in:{} out:{})",
+                crate::provider::pricing::format_usd(usd),
+                in_t,
+                out_t
+            )));
         }
     }
 }
@@ -1084,6 +1112,54 @@ mod plan_mode_tests {
         });
         assert!(app.current_tool.is_none());
         assert!(app.current_tool_started_at.is_none());
+    }
+
+    // --- F.10.08 /cost tests ---
+
+    #[test]
+    fn cost_command_pushes_status_line_with_total() {
+        let mut app = make_app();
+        app.cumulative_input_tokens = 1000;
+        app.cumulative_output_tokens = 200;
+        app.cumulative_cost_usd = 0.0123;
+        let before = app.history.len();
+        app.show_cost();
+        assert!(app.history.len() > before);
+        // The first pushed line is the total.
+        if let ChatEntry::StatusLine(line) = &app.history[before] {
+            assert!(line.contains("cost:"));
+            assert!(line.contains("in:1000"));
+            assert!(line.contains("out:200"));
+        } else {
+            panic!("expected StatusLine total, got {:?}", app.history[before]);
+        }
+    }
+
+    #[test]
+    fn cost_command_with_per_tool_breakdown_pushes_one_line_per_tool() {
+        let mut app = make_app();
+        app.per_tool_tokens.insert("bash".to_string(), (500, 100));
+        app.per_tool_tokens.insert("edit".to_string(), (300, 50));
+        let before = app.history.len();
+        app.show_cost();
+        let new_lines = app.history.len() - before;
+        // 1 total + 2 per-tool = 3
+        assert_eq!(new_lines, 3);
+        // Verify each per-tool line includes the tool name.
+        let mut found_bash = false;
+        let mut found_edit = false;
+        for entry in &app.history[before + 1..] {
+            if let ChatEntry::StatusLine(text) = entry {
+                if text.contains("bash") {
+                    found_bash = true;
+                }
+                if text.contains("edit") {
+                    found_edit = true;
+                }
+            }
+        }
+        assert!(found_bash);
+        assert!(found_edit);
     }
 }
 
