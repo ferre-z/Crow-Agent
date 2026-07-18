@@ -55,7 +55,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_status(frame, chunks[3], app);
 
     // Overlays paint last so they sit on top of the regular layout.
-    if app.picker_is_open() {
+    if app.approval_is_open() {
+        draw_approval_card(frame, area, app);
+    } else if app.picker_is_open() {
         draw_session_picker(frame, area, app);
     }
 }
@@ -384,5 +386,80 @@ fn draw_session_picker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         " Enter prints `crow tui --resume <id>` and exits ",
         Style::default().fg(Color::DarkGray),
     )]);
+    frame.render_widget(Paragraph::new(footer), rows[2]);
+}
+
+/// Render the approval card as a centered modal. Shows the tool
+/// name + a JSON-pretty view of the args + a y/n/a keymap hint.
+fn draw_approval_card(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let pending = match app.pending_approval.as_ref() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let popup_w = (area.width as u32 * 7 / 10).max(50) as u16;
+    let popup_h = (area.height as u32 / 2).max(11) as u16;
+    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+
+    // Dim background.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
+    let block = Block::default()
+        .title(format!(" Allow {} ? ", pending.tool_name()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let header = Line::from(vec![
+        Span::styled(
+            format!(" ask: {} ", pending.ask_id),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw("    "),
+        Span::styled(
+            "The agent wants to run:",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(header), rows[0]);
+
+    let args_text =
+        serde_json::to_string_pretty(pending.args()).unwrap_or_else(|_| pending.args().to_string());
+    let body = Paragraph::new(args_text)
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(body, rows[1]);
+
+    let footer = Line::from(vec![
+        Span::styled(
+            " [y] allow ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  [a] allow always (session)  ",
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            "  [n] deny ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    ]);
     frame.render_widget(Paragraph::new(footer), rows[2]);
 }

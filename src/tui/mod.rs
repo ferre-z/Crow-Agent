@@ -29,6 +29,7 @@
 //! "events" channel. The UI task never touches the agent directly.
 
 pub mod app;
+pub mod approval;
 pub mod commands;
 pub mod markdown;
 pub mod picker;
@@ -56,6 +57,7 @@ use crate::provider::Provider;
 use crate::session::{self, SessionWriter};
 
 pub use app::{App, InputMode, Overlay, RunPhase};
+pub use approval::{AllowList, Outcome as ApprovalOutcome, PendingApproval};
 pub use commands::{parse_slash, SlashOutcome};
 pub use picker::{PickerEntry, SessionPicker};
 
@@ -133,13 +135,20 @@ async fn run_inner(
     let writer = SessionWriter::open(&session_path)
         .await
         .with_context(|| format!("opening session log {session_path:?}"))?;
-    let agent_cfg = AgentConfig::new(
+    let mut agent_cfg = AgentConfig::new(
         config.max_turns,
         config.max_tool_calls,
         config.model.clone(),
         config.project_root.clone(),
         writer,
     );
+
+    // Ask channel: kernel -> UI. The agent pauses a tool call
+    // when the policy returns `Decision::Ask` and writes an
+    // `AskRequest` (with a oneshot response channel) here. The
+    // driver reads from this channel and feeds the UI.
+    let (ask_tx, ask_rx) = mpsc::channel::<crate::policy::AskRequest>(16);
+    agent_cfg = agent_cfg.with_ask_resolver(ask_tx);
 
     // Build or resume the agent. For v0 the TUI starts a new
     // conversation per session; the `--resume` flag reuses an
@@ -182,6 +191,7 @@ async fn run_inner(
     //   2. terminal input (keyboard, resize)
     //   3. a 100ms tick that drives the spinner / redraw while idle
     let mut events = event_rx;
+    let mut asks = ask_rx;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut term_events = crossterm::event::EventStream::new();
     let mut needs_redraw = true;
@@ -206,6 +216,17 @@ async fn run_inner(
                         // the agent loop exited. UI keeps going so
                         // the user can read the last state and quit.
                         app.mark_worker_gone();
+                        needs_redraw = true;
+                    }
+                }
+            }
+
+            // Policy-driven ask: an `AskRequest` from the agent.
+            // Hand it to the App, which auto-approves if the tool is
+            // in the session allowlist, otherwise shows the card.
+            maybe_ask = asks.recv() => {
+                if let Some(req) = maybe_ask {
+                    if app.install_pending_approval(req) {
                         needs_redraw = true;
                     }
                 }

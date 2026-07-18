@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::event::{AgentEvent, StopReason, ToolStream};
 use crate::ids::{SessionId, ToolCallId};
 use crate::message::Part;
+use crate::tui::approval::{AllowList, Outcome as ApprovalOutcome, PendingApproval};
 use crate::tui::picker::{PickerEntry, SessionPicker};
 
 /// Top-level TUI model.
@@ -95,6 +96,22 @@ pub struct App {
     /// driver reads this on the way out and prints a resume
     /// command; future slices may rebuild the agent in place.
     pub pending_resume: Option<String>,
+
+    /// Pending tool call awaiting the user's approval. `None` while
+    /// no policy-driven ask is in flight. Set by the driver when
+    /// the kernel sends an `AskRequest`; cleared when the user
+    /// resolves it (or the oneshot closes underneath us).
+    pub pending_approval: Option<PendingApproval>,
+
+    /// Per-session "always allow" allowlist. Tools in this set are
+    /// auto-approved without showing the card. The TUI driver
+    /// checks this BEFORE showing the overlay so repeated calls to
+    /// the same tool don't keep nagging the user.
+    pub allowlist: AllowList,
+
+    /// Last approval resolution, surfaced as a status line so the
+    /// user can see what they just decided. Reset on each new ask.
+    pub last_resolution: Option<String>,
 }
 
 impl App {
@@ -125,6 +142,9 @@ impl App {
             in_flight_tools: std::collections::HashMap::new(),
             picker: None,
             pending_resume: None,
+            pending_approval: None,
+            allowlist: AllowList::new(),
+            last_resolution: None,
         };
         for msg in history {
             replay_message(&mut app, msg);
@@ -337,6 +357,13 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        // Approval card has its own keymap. When an ask is in
+        // flight, ONLY approval keys apply — the composer is inert
+        // and the picker is hidden under the card.
+        if self.pending_approval.is_some() {
+            return self.handle_approval_key(code, modifiers);
+        }
+
         // Picker overlay has its own keymap. When the picker is
         // open, ONLY picker keys apply — the composer is inert.
         if self.picker.is_some() {
@@ -679,6 +706,100 @@ fn replay_message(app: &mut App, msg: crate::message::Message) {
                 }
             }
         }
+    }
+}
+
+/// Approval-card helpers live in their own `impl App` block
+/// because the App struct already has a long body; keeping
+/// these together here makes the slice boundaries easier to
+/// read.
+impl App {
+    /// Keymap for the approval card overlay. Returns `true` so the
+    /// UI redraws. The user picks one of three outcomes:
+    ///
+    /// - `y` / Enter — allow this single call
+    /// - `a` — allow this call AND add the tool to the session
+    ///   allowlist (so future calls of the same tool skip the card)
+    /// - `n` / Esc — deny the call
+    ///
+    /// All three outcomes resolve the pending ask immediately; the
+    /// caller (driver) reads [`App::take_pending_approval`] to
+    /// send the response back to the kernel.
+    fn handle_approval_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        let outcome = match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalOutcome::Allow),
+            KeyCode::Char('a') | KeyCode::Char('A') => Some(ApprovalOutcome::AllowAlways),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(ApprovalOutcome::Deny),
+            KeyCode::Enter => Some(ApprovalOutcome::Allow),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            self.resolve_pending_approval(outcome);
+            return true;
+        }
+        // Ignore Ctrl+C / unknown keys so a stray keypress doesn't
+        // accidentally allow or deny a destructive call.
+        let _ = modifiers;
+        true
+    }
+
+    /// Take the pending approval, send its response to the kernel,
+    /// update the allowlist on AllowAlways, and surface a status
+    /// line describing the decision. Called by the driver after the
+    /// user picks an outcome in the approval card.
+    pub fn resolve_pending_approval(&mut self, outcome: ApprovalOutcome) {
+        let Some(pending) = self.pending_approval.take() else {
+            return;
+        };
+        let tool = pending.tool_name().to_string();
+        let sent = pending.resolve(outcome, &mut self.allowlist);
+        let label = match outcome {
+            ApprovalOutcome::Allow => "allowed",
+            ApprovalOutcome::AllowAlways => "allowed (always for this session)",
+            ApprovalOutcome::Deny => "denied",
+        };
+        self.last_resolution = Some(if sent {
+            format!("{tool}: {label}")
+        } else {
+            format!("{tool}: {label} (channel closed, kernel may have moved on)")
+        });
+    }
+
+    /// Set the pending approval from an `AskRequest`. The driver
+    /// calls this when an ask arrives on the resolver channel and
+    /// the tool isn't already allowlisted.
+    ///
+    /// Returns `true` if the ask was installed; `false` if the tool
+    /// was already in the allowlist and the call was auto-approved
+    /// (the caller should respond `Allow` itself).
+    pub fn install_pending_approval(&mut self, req: crate::policy::AskRequest) -> bool {
+        let tool_name = req.call.name.clone();
+        if self.allowlist.allows(&tool_name) {
+            // Auto-allow: send Allow and drop the request. The
+            // driver doesn't need to know we skipped the card.
+            let _ = req.response.send(crate::policy::AskResponse::Allow);
+            self.last_resolution = Some(format!("{tool_name}: auto-allowed (allowlist)"));
+            return false;
+        }
+        let Some(pending) = PendingApproval::from_request(req) else {
+            // Malformed request — deny defensively so the agent
+            // doesn't hang on a closed oneshot.
+            return false;
+        };
+        self.pending_approval = Some(pending);
+        true
+    }
+
+    /// True if the approval card is currently visible.
+    #[must_use]
+    pub fn approval_is_open(&self) -> bool {
+        self.pending_approval.is_some()
+    }
+
+    /// Take the pending approval out of the App. Used by tests and
+    /// by the driver when the channel closes underneath us.
+    pub fn take_pending_approval(&mut self) -> Option<PendingApproval> {
+        self.pending_approval.take()
     }
 }
 
