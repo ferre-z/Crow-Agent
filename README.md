@@ -40,8 +40,46 @@ Default install uses the **debug** profile so it fits on disk-quota boxes (no `q
 | Build release | `cargo build --release` (or `make build`) |
 | Install release | `curl -sSf .../install.sh \| sh -s -- --release` |
 | Verify config | `crow doctor` |
-| Build the kernel + run all 225 tests | `make ci` |
+| Build the kernel + run all tests | `make ci` |
 | See every Makefile target | `make help` |
+| Launch the TUI | `crow tui` |
+| Resume a past session | `crow tui --resume <id>` |
+| Plan mode (read-only) | `crow tui --plan` |
+
+## Interactive terminal UI
+
+`crow tui` runs an interactive streaming REPL against the same
+kernel the headless `crow exec` uses. The visual surface matches
+Claude Code's `tui`:
+
+- Streaming assistant text with **markdown** (bold, italic,
+  inline code, fenced code, lists) via `pulldown-cmark`
+- **Tool cards** with diffs:
+  - `read` — line-numbered file preview
+  - `write` — file body preview
+  - `edit` — unified red/green diff via `similar`
+  - `bash` — command + stdout/stderr + status
+- **Session picker** overlay (`/resume`): arrow keys / PageUp-Down
+  to navigate, Enter to select, Esc to cancel
+- **Approval overlay** for policy-driven asks (`y` allow,
+  `a` allow for the rest of the session, `n` deny)
+- **Plan mode** (`--plan` or `/plan`): only `read` is available;
+  the agent can inspect code but cannot mutate
+- **Inline error banners** on `RunFailed` so failures are visible
+  after scrolling, not just in the status bar
+- **`--no-color`** for screen readers, dumb terminals, CI logs
+- **`/help` `/clear` `/doctor` `/model` `/quit`** slash commands
+- `PageUp` / `PageDown` / `End` to scroll the chat; tail-anchored
+  by default
+- `Esc` / `Ctrl+C` interrupt a run; `Ctrl+D` on empty input quits
+
+The TUI shares session storage with the headless CLI: each TUI run
+writes a JSONL log under `<project>/.crow/sessions/` that `crow
+sessions` lists and `crow tui --resume <id>` reuses.
+
+The Tauri 2 desktop app in `apps/desktop/` is still available
+for users who want a native window; it drives the same kernel
+through `crow serve`.
 
 ---
 
@@ -56,11 +94,14 @@ Default install uses the **debug** profile so it fits on disk-quota boxes (no `q
 - Project-root-confined tool registry with `read`, `write`, `edit`, `bash` shipped (`src/tool/`)
 - Agent state machine + tool-call loop with stop-reason handling, event sink, and durable `RunFailed` records (`src/agent.rs`)
 - Hierarchical `AGENTS.md` discovery + context compiler (`src/context.rs`)
-- Layered config (CLI > env > user file > defaults) + clap CLI with `exec`, `sessions`, `resume`, `doctor` subcommands (`src/cli.rs`, `src/config.rs`)
+- Layered config (CLI > env > user file > defaults) + clap CLI with `exec`, `sessions`, `resume`, `doctor`, `serve`, `mcp-opencode`, `tui` subcommands (`src/cli.rs`, `src/config.rs`)
 - Session recovery: trailing-sequence recovery, stale-lock eviction, crash-tail detection (`src/session.rs`)
 - `Agent::resume_into` for `crow --resume <id>` (`src/agent.rs`)
+- Interactive terminal UI: `crow tui` (`src/tui/`). Streaming REPL against the kernel, per-tool rich rendering with diffs, session picker, approval overlay with session-scoped "always allow", plan mode (`--plan`), markdown rendering in chat, `--no-color` for axe readers, inline error banners.
+- App-server (`crow serve`) JSON-RPC over stdio for the desktop shell and external CLIs.
+- Tauri 2 desktop shell (`apps/desktop/`) backed by `crow serve` as a sidecar.
 
-In progress: app-server (`crow serve`), Tauri 2 desktop shell, approval cards, plan mode, OS keyring.
+In progress: OS keyring, mcp-opencode server hardening.
 
 ## Stack
 
@@ -81,7 +122,7 @@ In progress: app-server (`crow serve`), Tauri 2 desktop shell, approval cards, p
 One binary crate. Module boundaries (from `src/`):
 
 ```
-cli.rs        # clap entry + subcommands (exec, sessions, resume, doctor)
+cli.rs        # clap entry + subcommands (exec, sessions, resume, doctor, tui, serve, mcp-opencode)
 config.rs     # layered config (CLI > env > user > defaults)
 ids.rs        # session, run, message, tool-call IDs (ULID)
 message.rs    # provider-neutral conversation data
@@ -94,6 +135,7 @@ provider/
 agent.rs      # state machine, tool-call loop, limits, cancellation, resume
 context.rs    # system prompt + AGENTS.md discovery
 session.rs    # JSONL writer/reader, recovery, stale-lock detection
+policy.rs     # ApprovalPolicy + AskResolver (drives the TUI approval overlay)
 tool/
   mod.rs      # Tool trait, registry, ToolSpec, limits
   path.rs     # project-root path resolution
@@ -101,6 +143,17 @@ tool/
   write.rs    # atomic temp+rename
   edit.rs     # exact-match replacement with diff summary
   bash.rs     # shell exec with process-group kill on timeout
+tui/          # interactive terminal UI (crow tui)
+  mod.rs      # driver: terminal setup, worker task, channels, main loop
+  app.rs      # App model + AgentEvent reducer + keymap
+  ui.rs       # layout, chat scrollback, header/status, picker, approval card
+  commands.rs # slash-command parser (/help, /clear, /resume, /plan, /quit, ...)
+  tools.rs    # per-tool rich rendering (read, write, edit, bash, generic)
+  picker.rs   # session picker state machine
+  approval.rs # approval overlay state + session allowlist
+  markdown.rs # pulldown-cmark -> ratatui Line
+app_server.rs # crow serve JSON-RPC over stdio
+mcp_opencode.rs # crow mcp-opencode (MCP server that delegates to opencode)
 tests/        # integration + gate tests
 ```
 
