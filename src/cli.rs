@@ -89,6 +89,14 @@ pub enum Command {
         #[arg(long)]
         binary: Option<PathBuf>,
     },
+    /// Launch the interactive terminal UI: streaming REPL against
+    /// the kernel, mirroring the Claude Code / opencode `tui` flow.
+    /// Pair with `--resume <id>` to continue an existing session.
+    Tui {
+        /// Resume an existing session by id (full or prefix).
+        #[arg(long, value_name = "SESSION_ID")]
+        resume: Option<String>,
+    },
     /// Print the version string (same as --version).
     Version,
 }
@@ -131,6 +139,12 @@ pub async fn run(args: Cli) -> Result<()> {
             // `serverInfo.version`.
             let version = Arc::new(env!("CARGO_PKG_VERSION").to_string());
             crate::mcp_opencode::run(binary, version).await
+        }
+        Command::Tui { resume } => {
+            // Project root is taken from the resolved config so the
+            // TUI operates on the same directory `crow exec` would.
+            let project_root = config.project_root.clone();
+            crate::tui::run(config, resume, project_root).await
         }
         Command::Version => {
             println!("crow {}", env!("CARGO_PKG_VERSION"));

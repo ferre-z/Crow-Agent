@@ -54,6 +54,14 @@ nix = { version = "0.27", features = ["signal", "process"] }
 clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
 dirs = "5"
+# TUI mode (interactive REPL against the kernel). Kept on the main
+# dep list so the shipped binary carries the TUI; behind a CLI flag
+# so headless workflows stay unaffected.
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = "0.7"
+unicode-width = "0.2"
+pulldown-cmark = { version = "0.13" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

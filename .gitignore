@@ -4,3 +4,6 @@ target/
 .env
 .env.local
 .review-packages/
+# Crow runtime state — sessions, doctor cache, anything the agent
+# writes under the project root. Per-user, never committed.
+.crow/

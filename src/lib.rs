@@ -27,6 +27,7 @@ pub mod provider;
 pub mod session;
 pub mod session_entry;
 pub mod tool;
+pub mod tui;
 
 pub use cancel::{timeout_or_cancel, CancelOutcome, CancellationToken};
 pub use event::*;
