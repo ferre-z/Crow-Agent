@@ -151,6 +151,12 @@ pub struct App {
     /// `pricing` (F.04.05).
     pub cumulative_cost_usd: f64,
 
+    /// Extra directories the user has granted the agent access to
+    /// beyond `project_root`, via `/add-dir <path>` (F.10.16).
+    /// Each entry is canonicalised (relative paths are resolved
+    /// against cwd). The list grows as the user runs `/add-dir`.
+    pub allowed_extra_dirs: Vec<std::path::PathBuf>,
+
     /// Plan mode flag. When true, the agent only has `read`
     /// available — it can inspect code but cannot mutate files
     /// or run shell commands. Set at startup from the `--plan`
@@ -235,6 +241,7 @@ impl App {
             current_tool_started_at: None,
             pricing,
             cumulative_cost_usd: 0.0,
+            allowed_extra_dirs: Vec::new(),
             plan_mode,
             no_color,
         };
@@ -686,6 +693,7 @@ impl App {
             }
             "cost" => self.show_cost(),
             "status" => self.show_status(),
+            "add-dir" => self.add_dir(args),
             _ => {}
         }
     }
@@ -1030,6 +1038,41 @@ impl App {
         self.current_tool_started_at = None;
         self.last_error = None;
         self.pending_approval = None;
+        self.allowed_extra_dirs.clear();
+    }
+
+    /// F.10.16 — `/add-dir <path>` grants the agent access to
+    /// `<path>` in addition to `project_root`. Relative paths are
+    /// resolved against `project_root`. Pushing a status line so
+    /// the user has feedback.
+    pub fn add_dir(&mut self, args: &str) {
+        let raw = args.trim();
+        if raw.is_empty() {
+            self.history.push(ChatEntry::StatusLine(
+                "add-dir: usage: /add-dir <path>".to_string(),
+            ));
+            return;
+        }
+        let p = std::path::PathBuf::from(raw);
+        let absolute = if p.is_absolute() {
+            p
+        } else {
+            self.config.project_root.join(p)
+        };
+        // Canonicalise so duplicates / `..` collapse cleanly.
+        let canonical = absolute.canonicalize().unwrap_or(absolute);
+        if self.allowed_extra_dirs.contains(&canonical) {
+            self.history.push(ChatEntry::StatusLine(format!(
+                "add-dir: already allowed: {}",
+                canonical.display()
+            )));
+            return;
+        }
+        self.allowed_extra_dirs.push(canonical.clone());
+        self.history.push(ChatEntry::StatusLine(format!(
+            "add-dir: granted access to {}",
+            canonical.display()
+        )));
     }
 
     /// Toggle plan mode. The driver routes the user's `/plan`
@@ -1283,6 +1326,56 @@ mod plan_mode_tests {
         assert!(all.contains("plan mode:  false"));
         assert!(all.contains("tokens:     in:1234 out:567"));
         assert!(all.contains("cost:"));
+    }
+
+    // --- F.10.16 /add-dir tests ---
+
+    #[test]
+    fn add_dir_with_no_args_prints_usage() {
+        let mut app = make_app();
+        let before = app.history.len();
+        app.add_dir("");
+        assert_eq!(app.history.len() - before, 1);
+        if let ChatEntry::StatusLine(text) = &app.history[before] {
+            assert!(text.contains("usage:"));
+        } else {
+            panic!("expected StatusLine");
+        }
+        assert!(app.allowed_extra_dirs.is_empty());
+    }
+
+    #[test]
+    fn add_dir_with_relative_path_resolves_against_project_root() {
+        let mut app = make_app();
+        // Use a path that resolves to something real on the test
+        // machine. /tmp is portable.
+        let before = app.allowed_extra_dirs.len();
+        app.add_dir("/tmp");
+        assert_eq!(app.allowed_extra_dirs.len(), before + 1);
+        let added = &app.allowed_extra_dirs[before];
+        assert!(
+            added.is_absolute(),
+            "added path should be absolute: {added:?}"
+        );
+        assert!(added.starts_with("/tmp"));
+    }
+
+    #[test]
+    fn add_dir_is_idempotent() {
+        let mut app = make_app();
+        app.add_dir("/tmp");
+        let after_first = app.allowed_extra_dirs.len();
+        app.add_dir("/tmp");
+        assert_eq!(app.allowed_extra_dirs.len(), after_first);
+    }
+
+    #[test]
+    fn reset_session_clears_allowed_extra_dirs() {
+        let mut app = make_app();
+        app.add_dir("/tmp");
+        assert!(!app.allowed_extra_dirs.is_empty());
+        app.reset_session();
+        assert!(app.allowed_extra_dirs.is_empty());
     }
 }
 
