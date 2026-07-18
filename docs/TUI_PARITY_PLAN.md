@@ -785,17 +785,19 @@ The first 10 numbered slices I'll land, in order. Each is small
 enough to ship in one commit, each closes a concrete piece of
 parity, and each has a clear demo path.
 
-1. **F.04.04 — Status bar cumulative tokens** (Medium, ~80 LOC)
+1. **F.04.04 — Status bar cumulative tokens** (Medium, ~80 LOC) — **SHIPPED `4ee5a8d`**
 2. **F.04.05 — Status bar cumulative cost** (Medium, ~150 LOC,
-   adds `config/pricing.toml`)
-3. **F.04.03 — Live tool timer** (Medium, ~120 LOC)
-4. **F.10.08 — `/cost` slash command** (Easy, builds on F.04.05)
-5. **F.10.15 — `/status` slash command** (Easy, builds on F.04.04)
-6. **F.10.16 — `/add-dir <path>`** (Medium, ~100 LOC, kernel change)
-7. **F.20.03 — Rule pattern with arg regexes** (Hard, ~200 LOC)
-8. **F.10.04 — Friendly session naming** (Medium, ~150 LOC)
-9. **F.40.05 — Auto-naming from first prompt** (Medium, ~100 LOC)
-10. **F.10.09 — `/compact` context summarisation** (Hard, ~300 LOC)
+   adds `config/pricing.toml`) — **SHIPPED `a23aa6e`**
+3. **F.04.03 — Live tool timer** (Medium, ~120 LOC) — **SHIPPED `4ee5a8d`** (landed alongside slice 1)
+4. **F.10.08 — `/cost` slash command** (Easy, builds on F.04.05) — **SHIPPED `7b2e097`**
+5. **F.10.15 — `/status` slash command** (Easy, builds on F.04.04) — **SHIPPED `7811d17`**
+6. **F.10.16 — `/add-dir <path>`** (Medium, ~100 LOC, kernel change) — **SHIPPED `3228bbb`** (App-side plumbing; kernel integration lands in a follow-up)
+7. **F.20.03 — Rule pattern with arg regexes** (Hard, ~200 LOC) — **SHIPPED `d44a903`**
+8. **F.10.04 — Friendly session naming** (Medium, ~150 LOC) — **SHIPPED `bcc537c`**
+9. **F.40.05 — Auto-naming from first prompt** (Medium, ~100 LOC) — **SHIPPED `925bda8`**
+10. **F.10.09 — `/compact` context summarisation** (Hard, ~300 LOC) — **SHIPPED `925bda8`** (lite: status indicator only; full kernel-side compaction lands in a follow-up)
+
+All 10 slices landed in 9 commits (slices 1+3 and 9+10 share commits).
 
 After the first 10, I'll continue with the remaining layers in
 rough order: more slash commands, more tools, mouse + themes,
