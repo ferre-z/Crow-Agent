@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::event::{AgentEvent, StopReason, ToolStream};
 use crate::ids::{SessionId, ToolCallId};
 use crate::message::Part;
+use crate::provider::pricing::Pricing;
 use crate::tui::approval::{AllowList, Outcome as ApprovalOutcome, PendingApproval};
 use crate::tui::picker::{PickerEntry, SessionPicker};
 
@@ -136,6 +137,16 @@ pub struct App {
     /// Drives the live tool timer in the status bar (F.04.03).
     pub current_tool_started_at: Option<std::time::Instant>,
 
+    /// Per-model token pricing table (F.04.05). Loaded from
+    /// `<repo>/config/pricing.toml` at App construction; falls
+    /// back to zero rates if the file is missing.
+    pub pricing: Pricing,
+
+    /// Cumulative USD cost for this session, computed from
+    /// `cumulative_input_tokens`/`cumulative_output_tokens` and
+    /// `pricing` (F.04.05).
+    pub cumulative_cost_usd: f64,
+
     /// Plan mode flag. When true, the agent only has `read`
     /// available — it can inspect code but cannot mutate files
     /// or run shell commands. Set at startup from the `--plan`
@@ -161,6 +172,11 @@ impl App {
         plan_mode: bool,
         no_color: bool,
     ) -> Self {
+        // Pricing lives at <repo>/config/pricing.toml. We resolve
+        // it relative to the config's project_root so users can
+        // ship a per-project pricing table. (F.04.05.)
+        let pricing_path = config.project_root.join("config").join("pricing.toml");
+        let pricing = Pricing::load(&pricing_path);
         let mut app = Self {
             config: config.clone(),
             session_path,
@@ -189,6 +205,8 @@ impl App {
             per_tool_tokens: std::collections::BTreeMap::new(),
             current_tool: None,
             current_tool_started_at: None,
+            pricing,
+            cumulative_cost_usd: 0.0,
             plan_mode,
             no_color,
         };

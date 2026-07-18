@@ -18,6 +18,7 @@
 
 pub mod genai;
 pub mod mock;
+pub mod pricing;
 pub mod stream;
 
 use async_trait::async_trait;

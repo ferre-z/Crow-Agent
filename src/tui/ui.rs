@@ -310,6 +310,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Style::default().fg(Color::DarkGray),
     ));
+    // F.04.05 — cumulative USD cost.
+    spans.push(Span::raw("    "));
+    spans.push(Span::styled(
+        crate::provider::pricing::format_usd(app.cumulative_cost_usd),
+        Style::default().fg(Color::Green),
+    ));
     spans.push(Span::raw("    "));
     spans.push(Span::styled(
         format!("session {}", short_session_id(&app.session_id)),
