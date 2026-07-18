@@ -140,8 +140,9 @@ fn render_history(app: &App) -> Vec<Line<'static>> {
                 stdout,
                 stderr,
             } => {
-                render_tool_card(
-                    &mut out, name, args, output, *is_error, *truncated, stdout, stderr,
+                let renderer = super::tools::ToolRenderer::from_name(name);
+                out.extend(
+                    renderer.render(name, args, output, *is_error, *truncated, stdout, stderr),
                 );
             }
             ChatEntry::StatusLine(text) => {
@@ -153,72 +154,6 @@ fn render_history(app: &App) -> Vec<Line<'static>> {
         }
     }
     out
-}
-
-/// Render a tool invocation card. The shape is the same across tool
-/// types — name + args header, then the output body — so any
-/// per-tool styling lands in this one function.
-#[allow(clippy::too_many_arguments)]
-fn render_tool_card(
-    out: &mut Vec<Line<'static>>,
-    name: &str,
-    args: &serde_json::Value,
-    output: &str,
-    is_error: bool,
-    truncated: bool,
-    stdout: &str,
-    stderr: &str,
-) {
-    let dot = if is_error { "✗" } else { "✓" };
-    let dot_color = if is_error { Color::Red } else { Color::Green };
-    let header = format!("  {dot} {name}({})", truncate(&args.to_string(), 60));
-    out.push(Line::from(vec![
-        Span::styled(format!(" {dot} "), Style::default().fg(dot_color)),
-        Span::styled(
-            name.to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("({})", truncate(&args.to_string(), 60)),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-    let _ = header; // silence unused warning for now; we use the styled header above
-    if !stdout.is_empty() {
-        for line in stdout.split('\n') {
-            out.push(Line::from(Span::styled(
-                format!("    │ {line}"),
-                Style::default().fg(Color::White),
-            )));
-        }
-    }
-    if !stderr.is_empty() {
-        for line in stderr.split('\n') {
-            out.push(Line::from(Span::styled(
-                format!("    ⎿ {line}"),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-    }
-    if !output.is_empty() {
-        for line in output.split('\n') {
-            out.push(Line::from(Span::styled(
-                format!("    ↳ {line}"),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    }
-    if truncated {
-        out.push(Line::from(Span::styled(
-            "    … (output truncated)",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::ITALIC),
-        )));
-    }
-    out.push(Line::raw(""));
 }
 
 /// The composer. A boxed textarea with a green `❯` gutter.
@@ -319,27 +254,6 @@ fn compute_scroll(total: usize, viewport: usize, scroll_back: usize) -> usize {
         return max;
     }
     max.saturating_sub(scroll_back).min(max)
-}
-
-/// Truncate a string to a unicode-width budget, appending `…` if it
-/// doesn't fit. Used for tool arg summaries in the card header.
-fn truncate(s: &str, max_width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut w = 0;
-    for ch in s.chars() {
-        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if w + cw > max_width.saturating_sub(1) {
-            out.push('…');
-            return out;
-        }
-        out.push(ch);
-        w += cw;
-    }
-    out
 }
 
 /// Show only the tail of an absolute path so it fits the header.

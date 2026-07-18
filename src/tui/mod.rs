@@ -31,6 +31,7 @@
 pub mod app;
 pub mod commands;
 pub mod markdown;
+pub mod tools;
 pub mod ui;
 
 use std::path::PathBuf;
