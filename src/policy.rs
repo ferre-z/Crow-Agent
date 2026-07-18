@@ -97,7 +97,7 @@ impl ApprovalPolicy for DefaultPolicy {
 /// Rules are loaded from `~/.config/crow/policy.toml` (see
 /// [`RuleBasedPolicy::from_file`]).
 pub struct RuleBasedPolicy {
-    rules: Vec<PolicyRule>,
+    rules: Vec<CompiledRule>,
     fallback: Arc<dyn ApprovalPolicy>,
 }
 
@@ -110,24 +110,75 @@ impl std::fmt::Debug for RuleBasedPolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// One named regex matcher against a tool call's args. The `arg`
+/// field is a JSON-pointer-ish key into `ToolCall::args` (currently
+/// only top-level keys are supported; nested paths land in a
+/// follow-up slice). `regex` is the source string of a `regex::Regex`
+/// compiled at rule-load time.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ArgPattern {
+    /// Name of the argument to match (e.g. `"command"` for bash,
+    /// `"path"` for write/edit/read).
+    pub arg: String,
+    /// Regex source. Compiled once when the rule is loaded; load
+    /// fails if the regex is invalid.
+    pub regex: String,
+}
+
+/// Compiled form of [`PolicyRule`]. Built from the on-disk form by
+/// [`compile_rule`]; the live policy stores these so we never
+/// recompile on every `decide` call.
+#[derive(Debug)]
+pub struct CompiledRule {
+    pub tool: String,
+    pub arg_patterns: Vec<(String, regex::Regex)>,
+    pub command_starts_with: Option<String>,
+    pub decision: RuleDecision,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PolicyRule {
     /// Tool name this rule matches. Use `"*"` to match any tool.
     pub tool: String,
     /// If set, match `bash` tool calls whose `command` starts with
-    /// this substring (e.g. `"rm -rf"`).
+    /// this substring (e.g. `"rm -rf"`). Backward-compatible
+    /// substring matcher; prefer `arg_patterns` for new rules.
     #[serde(default)]
     pub command_starts_with: Option<String>,
+    /// If non-empty, match the rule only if every `(arg, regex)`
+    /// pair matches the corresponding argument on the tool call.
+    /// Regex syntax is `regex::Regex`'s default flavour.
+    #[serde(default)]
+    pub arg_patterns: Vec<ArgPattern>,
     /// The decision if this rule matches.
     pub decision: RuleDecision,
+}
+
+/// Compile a [`PolicyRule`] into its runtime form. Returns
+/// `Err(reason)` on invalid regex so the operator sees a clear
+/// error at rule load time, not at the first call.
+pub fn compile_rule(rule: PolicyRule) -> Result<CompiledRule, String> {
+    let mut compiled = Vec::with_capacity(rule.arg_patterns.len());
+    for ap in rule.arg_patterns {
+        let re = regex::Regex::new(&ap.regex)
+            .map_err(|e| format!("invalid regex for arg '{}': {}", ap.arg, e))?;
+        compiled.push((ap.arg, re));
+    }
+    Ok(CompiledRule {
+        tool: rule.tool,
+        arg_patterns: compiled,
+        command_starts_with: rule.command_starts_with,
+        decision: rule.decision,
+    })
 }
 
 /// One of the rule's three decisions. Same shape as [`Decision`]
 /// minus the `Ask` channel — a rule either allows, denies, or
 /// re-routes to the fallback.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleDecision {
+    #[default]
     Allow,
     Deny,
     Fallback,
@@ -135,8 +186,20 @@ pub enum RuleDecision {
 
 impl RuleBasedPolicy {
     /// Build a rule-based policy that defers to `fallback` when no
-    /// rule matches.
+    /// rule matches. Invalid regexes in `arg_patterns` are dropped
+    /// with a warning rather than failing the whole load — partial
+    /// rules are better than no rules.
     pub fn new(rules: Vec<PolicyRule>, fallback: Arc<dyn ApprovalPolicy>) -> Self {
+        let rules = rules
+            .into_iter()
+            .filter_map(|r| match compile_rule(r) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!("policy rule dropped: {e}");
+                    None
+                }
+            })
+            .collect();
         Self { rules, fallback }
     }
 
@@ -175,9 +238,20 @@ impl ApprovalPolicy for RuleBasedPolicy {
             if !tool_matches {
                 continue;
             }
+            // arg_patterns: every (arg, regex) pair must match.
+            // A rule with empty arg_patterns and no
+            // command_starts_with matches the tool unconditionally.
+            let args_match = rule.arg_patterns.iter().all(|(arg, re)| {
+                call.args
+                    .get(arg)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| re.is_match(s))
+            });
+            if !args_match {
+                continue;
+            }
+            // Backward-compatible substring matcher.
             if let Some(prefix) = &rule.command_starts_with {
-                // Only `bash` carries a `command` argument; other
-                // tools ignore the prefix matcher.
                 if call.name != "bash" {
                     continue;
                 }
@@ -327,6 +401,7 @@ mod tests {
         let rules = vec![PolicyRule {
             tool: "bash".into(),
             command_starts_with: None,
+            arg_patterns: vec![],
             decision: RuleDecision::Allow,
         }];
         let policy = RuleBasedPolicy::new(rules, Arc::new(DefaultPolicy));
@@ -341,6 +416,7 @@ mod tests {
         let rules = vec![PolicyRule {
             tool: "*".into(),
             command_starts_with: None,
+            arg_patterns: vec![],
             decision: RuleDecision::Deny,
         }];
         let policy = RuleBasedPolicy::new(rules, Arc::new(DefaultPolicy));
@@ -355,6 +431,7 @@ mod tests {
         let rules = vec![PolicyRule {
             tool: "bash".into(),
             command_starts_with: Some("rm -rf".into()),
+            arg_patterns: vec![],
             decision: RuleDecision::Deny,
         }];
         let policy = RuleBasedPolicy::new(rules, Arc::new(DefaultPolicy));
@@ -380,6 +457,7 @@ mod tests {
         let rules = vec![PolicyRule {
             tool: "bash".into(),
             command_starts_with: Some("ls".into()),
+            arg_patterns: vec![],
             decision: RuleDecision::Fallback,
         }];
         let policy = RuleBasedPolicy::new(rules, Arc::new(DefaultPolicy));
@@ -427,5 +505,113 @@ decision = "deny"
             .decide(&call("bash", json!({"command": "ls"})), &[])
             .await;
         assert!(matches!(d, Decision::Ask { .. }));
+    }
+
+    // --- F.20.03 arg_patterns tests ---
+
+    #[tokio::test]
+    async fn arg_pattern_allows_matching_command() {
+        let p = RuleBasedPolicy::new(
+            vec![PolicyRule {
+                tool: "bash".into(),
+                command_starts_with: None,
+                arg_patterns: vec![ArgPattern {
+                    arg: "command".into(),
+                    regex: r"^git (status|diff)$".into(),
+                }],
+                decision: RuleDecision::Allow,
+            }],
+            Arc::new(DefaultPolicy),
+        );
+        let d = p
+            .decide(&call("bash", json!({"command": "git status"})), &[])
+            .await;
+        assert!(matches!(d, Decision::Allow));
+        let d = p
+            .decide(&call("bash", json!({"command": "git diff"})), &[])
+            .await;
+        assert!(matches!(d, Decision::Allow));
+        // git push doesn't match the regex; falls through to the
+        // default policy's Ask decision.
+        let d = p
+            .decide(&call("bash", json!({"command": "git push"})), &[])
+            .await;
+        assert!(matches!(d, Decision::Ask { .. }));
+    }
+
+    #[tokio::test]
+    async fn arg_pattern_matches_write_to_etc() {
+        let p = RuleBasedPolicy::new(
+            vec![PolicyRule {
+                tool: "write".into(),
+                command_starts_with: None,
+                arg_patterns: vec![ArgPattern {
+                    arg: "path".into(),
+                    regex: r"^/etc/".into(),
+                }],
+                decision: RuleDecision::Deny,
+            }],
+            Arc::new(DefaultPolicy),
+        );
+        let d = p
+            .decide(
+                &call("write", json!({"path": "/etc/hosts", "content": "x"})),
+                &[],
+            )
+            .await;
+        assert!(matches!(d, Decision::Deny { .. }));
+        let d = p
+            .decide(
+                &call("write", json!({"path": "/tmp/x", "content": "y"})),
+                &[],
+            )
+            .await;
+        // /tmp/x doesn't match the /etc pattern, so the rule doesn't
+        // apply. Falls through to the fallback DefaultPolicy which
+        // asks for write.
+        assert!(matches!(d, Decision::Ask { .. }));
+    }
+
+    #[test]
+    fn invalid_regex_is_dropped_at_load_time() {
+        // A rule with an invalid regex should be dropped, not panic.
+        let p = RuleBasedPolicy::new(
+            vec![PolicyRule {
+                tool: "bash".into(),
+                command_starts_with: None,
+                arg_patterns: vec![ArgPattern {
+                    arg: "command".into(),
+                    regex: r"(unclosed".into(), // invalid regex
+                }],
+                decision: RuleDecision::Allow,
+            }],
+            Arc::new(DefaultPolicy),
+        );
+        assert_eq!(p.rules.len(), 0);
+    }
+
+    #[test]
+    fn multiple_arg_patterns_all_must_match() {
+        let p = RuleBasedPolicy::new(
+            vec![PolicyRule {
+                tool: "bash".into(),
+                command_starts_with: None,
+                arg_patterns: vec![
+                    ArgPattern {
+                        arg: "command".into(),
+                        regex: r"^git push".into(),
+                    },
+                    ArgPattern {
+                        arg: "timeout_ms".into(),
+                        regex: r"^[0-9]+$".into(),
+                    },
+                ],
+                decision: RuleDecision::Allow,
+            }],
+            Arc::new(DefaultPolicy),
+        );
+        // Both match.
+        assert_eq!(p.rules.len(), 1);
+        let _ = &p; // silence unused
     }
 }

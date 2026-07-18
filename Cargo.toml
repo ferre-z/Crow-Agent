@@ -47,6 +47,7 @@ ignore = "0.4"
 similar = "2"
 jsonschema = "0.17"
 sha2 = "0.10"
+regex = "1"
 # Wave 3 additions:
 secrecy = "0.8"
 nix = { version = "0.27", features = ["signal", "process"] }
