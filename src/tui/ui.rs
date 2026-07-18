@@ -62,9 +62,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-/// Top header: model name, session path tail. Single-line.
+/// Top header: model name, plan-mode badge, session path tail.
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = Line::from(vec![
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled(
             " crow ",
             Style::default().bg(Color::Rgb(40, 80, 60)).fg(Color::White),
@@ -74,12 +74,25 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             format!("model: {}", app.model_label),
             Style::default().fg(Color::Cyan),
         ),
-        Span::raw("  "),
-        Span::styled(
-            format!("session: {}", short_path(&app.session_path)),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
+    ];
+    if app.plan_mode {
+        // Bright-yellow badge so the user can see at a glance that
+        // they're in the read-only sandbox.
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            " PLAN ",
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("session: {}", short_path(&app.session_path)),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let title = Line::from(spans);
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(Color::DarkGray));

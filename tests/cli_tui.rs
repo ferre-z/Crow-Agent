@@ -42,3 +42,13 @@ fn tui_unknown_subflag_is_rejected() {
         .failure()
         .stderr(predicate::str::contains("error"));
 }
+
+#[test]
+fn tui_help_describes_plan_flag() {
+    Command::cargo_bin("crow")
+        .unwrap()
+        .args(["tui", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--plan"));
+}

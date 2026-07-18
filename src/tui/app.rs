@@ -112,6 +112,15 @@ pub struct App {
     /// Last approval resolution, surfaced as a status line so the
     /// user can see what they just decided. Reset on each new ask.
     pub last_resolution: Option<String>,
+
+    /// Plan mode flag. When true, the agent only has `read`
+    /// available — it can inspect code but cannot mutate files
+    /// or run shell commands. Set at startup from the `--plan`
+    /// CLI flag; the `/plan` slash command toggles this at
+    /// runtime (takes effect on the next session, since the tool
+    /// registry is owned by the worker task and rebuild is
+    /// non-trivial).
+    pub plan_mode: bool,
 }
 
 impl App {
@@ -121,6 +130,7 @@ impl App {
         config: Config,
         session_path: PathBuf,
         history: Vec<crate::message::Message>,
+        plan_mode: bool,
     ) -> Self {
         let mut app = Self {
             config: config.clone(),
@@ -145,6 +155,7 @@ impl App {
             pending_approval: None,
             allowlist: AllowList::new(),
             last_resolution: None,
+            plan_mode,
         };
         for msg in history {
             replay_message(&mut app, msg);
@@ -556,6 +567,13 @@ impl App {
                     )));
                 }
             }
+            "plan" => {
+                // The driver should have intercepted this too — see
+                // the matching arm in the driver's slash dispatch.
+                // If we land here, surface the toggle so the user
+                // gets feedback either way.
+                self.toggle_plan_mode();
+            }
             _ => {}
         }
     }
@@ -801,6 +819,86 @@ impl App {
     pub fn take_pending_approval(&mut self) -> Option<PendingApproval> {
         self.pending_approval.take()
     }
+
+    /// Toggle plan mode. The driver routes the user's `/plan`
+    /// slash command through here. The current session's tool
+    /// registry is not rebuilt mid-flight (the worker task owns
+    /// it); the new mode applies on the next session.
+    pub fn toggle_plan_mode(&mut self) {
+        self.plan_mode = !self.plan_mode;
+        let label = if self.plan_mode {
+            "on (read-only; restart to apply)"
+        } else {
+            "off (full toolset; restart to apply)"
+        };
+        self.history
+            .push(ChatEntry::StatusLine(format!("plan mode: {label}")));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)] // SLASH_HELP + short_args live below by file convention
+mod plan_mode_tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            base_url: "https://example.invalid".into(),
+            model: "test-model".into(),
+            api_key: secrecy::Secret::new(String::new()),
+            max_turns: 10,
+            max_tool_calls: 10,
+            max_output_bytes: 8192,
+            command_timeout_secs: 30,
+            project_root: PathBuf::from("/tmp/test"),
+            sessions_dir: PathBuf::from("/tmp/test/.crow/sessions"),
+        }
+    }
+
+    fn make_app() -> App {
+        App::new(
+            test_config(),
+            PathBuf::from("/tmp/test.jsonl"),
+            Vec::new(),
+            false,
+        )
+    }
+
+    #[test]
+    fn plan_mode_starts_off() {
+        let app = make_app();
+        assert!(!app.plan_mode);
+    }
+
+    #[test]
+    fn plan_mode_starts_on_when_requested() {
+        let app = App::new(test_config(), PathBuf::from("/tmp/x"), Vec::new(), true);
+        assert!(app.plan_mode);
+    }
+
+    #[test]
+    fn toggle_plan_mode_flips_state() {
+        let mut app = make_app();
+        assert!(!app.plan_mode);
+        app.toggle_plan_mode();
+        assert!(app.plan_mode);
+        app.toggle_plan_mode();
+        assert!(!app.plan_mode);
+    }
+
+    #[test]
+    fn toggle_plan_mode_pushes_status_line() {
+        let mut app = make_app();
+        let before = app.history.len();
+        app.toggle_plan_mode();
+        assert!(app.history.len() > before);
+        let last = app.history.last().expect("status line");
+        if let ChatEntry::StatusLine(text) = last {
+            assert!(text.starts_with("plan mode:"));
+        } else {
+            panic!("expected StatusLine, got {last:?}");
+        }
+    }
 }
 
 /// Help text shown by `/help`.
@@ -810,7 +908,8 @@ Available commands:
   /clear       clear the scrollback
   /model       show the active model
   /doctor      show config snapshot
-  /resume <id> resume an existing session (handled by CLI flag for now)
+  /resume      open the session picker overlay
+  /plan        toggle plan mode (read-only; restart to apply)
   /quit        exit the TUI (Ctrl+D on empty input also quits)
 
 Shortcuts:
@@ -818,7 +917,9 @@ Shortcuts:
   Shift+Enter    insert a newline
   PageUp/PageDown  scroll the chat
   Esc / Ctrl+C   interrupt the current run (twice to quit)
-  End            jump to the latest message";
+  End            jump to the latest message
+
+Pass --plan on startup to begin in read-only mode.";
 
 /// Render JSON args compactly: `{"path":"/tmp/x"}` stays one line,
 /// bigger objects get truncated with an ellipsis.

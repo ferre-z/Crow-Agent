@@ -96,6 +96,11 @@ pub enum Command {
         /// Resume an existing session by id (full or prefix).
         #[arg(long, value_name = "SESSION_ID")]
         resume: Option<String>,
+        /// Start in plan mode: only `read` is available; the agent
+        /// can inspect code but cannot mutate files or run shell
+        /// commands. Matches Claude Code's plan mode UX.
+        #[arg(long)]
+        plan: bool,
     },
     /// Print the version string (same as --version).
     Version,
@@ -140,11 +145,11 @@ pub async fn run(args: Cli) -> Result<()> {
             let version = Arc::new(env!("CARGO_PKG_VERSION").to_string());
             crate::mcp_opencode::run(binary, version).await
         }
-        Command::Tui { resume } => {
+        Command::Tui { resume, plan } => {
             // Project root is taken from the resolved config so the
             // TUI operates on the same directory `crow exec` would.
             let project_root = config.project_root.clone();
-            crate::tui::run(config, resume, project_root).await
+            crate::tui::run(config, resume, project_root, plan).await
         }
         Command::Version => {
             println!("crow {}", env!("CARGO_PKG_VERSION"));
@@ -333,14 +338,24 @@ fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
 }
 
 /// Default registry for the CLI: ships `read`, `write`, `edit`,
-/// and `bash`. Plan mode (wave 7) will switch to a read-only subset
-/// of this.
+/// and `bash`. Plan mode uses [`read_only_registry`] instead.
 pub fn default_registry() -> Arc<ToolRegistry> {
     let mut reg = ToolRegistry::new();
     reg.register(ReadTool);
     reg.register(WriteTool);
     reg.register(EditTool);
     reg.register(BashTool);
+    Arc::new(reg)
+}
+
+/// Read-only registry: only `read`. Used when the TUI is started
+/// with `--plan`. The kernel can then read files but cannot
+/// mutate them or run shell commands. Useful for "review-only"
+/// sessions where the user wants the agent to inspect code
+/// without touching anything.
+pub fn read_only_registry() -> Arc<ToolRegistry> {
+    let mut reg = ToolRegistry::new();
+    reg.register(ReadTool);
     Arc::new(reg)
 }
 

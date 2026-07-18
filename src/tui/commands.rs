@@ -46,8 +46,8 @@ pub fn parse_slash(input: &str) -> Option<SlashOutcome> {
 }
 
 /// Enumerated slash commands. Add new variants here, then handle
-/// them in [`App::apply_local_slash`] (for `Local` effects) or in
-/// the TUI driver (for `Quit` / `Submit`).
+/// them in [`crate::tui::app::App::apply_local_slash`] (for
+/// `Local` effects) or in the TUI driver (for `Quit` / async).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // some variants are matched in FromStr, not constructed directly
 enum SlashCommand {
@@ -58,6 +58,7 @@ enum SlashCommand {
     Doctor,
     Model,
     Resume,
+    Plan,
 }
 
 impl SlashCommand {
@@ -69,6 +70,7 @@ impl SlashCommand {
             SlashCommand::Doctor => "doctor",
             SlashCommand::Model => "model",
             SlashCommand::Resume => "resume",
+            SlashCommand::Plan => "plan",
             SlashCommand::Quit | SlashCommand::Exit => return SlashOutcome::Quit,
         };
         SlashOutcome::Local {
@@ -89,6 +91,7 @@ impl FromStr for SlashCommand {
             "doctor" => Self::Doctor,
             "model" => Self::Model,
             "resume" => Self::Resume,
+            "plan" => Self::Plan,
             _ => return Err(()),
         })
     }
