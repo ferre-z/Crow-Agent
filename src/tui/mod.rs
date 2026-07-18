@@ -72,6 +72,7 @@ pub async fn run(
     resume: Option<String>,
     _project_root: PathBuf,
     plan_mode: bool,
+    no_color: bool,
 ) -> Result<()> {
     // Set up the terminal. Raw mode + alternate screen so the user's
     // shell history is untouched on exit.
@@ -86,7 +87,7 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
 
-    let result = run_inner(&mut terminal, config, resume, plan_mode).await;
+    let result = run_inner(&mut terminal, config, resume, plan_mode, no_color).await;
 
     // Always restore the terminal, even on error, so the user is not
     // left staring at a broken prompt.
@@ -105,6 +106,7 @@ async fn run_inner(
     config: Config,
     resume: Option<String>,
     plan_mode: bool,
+    no_color: bool,
 ) -> Result<()> {
     // Build the provider. We do this here (before any TUI drawing)
     // so credential errors surface as a clean stderr message rather
@@ -195,6 +197,7 @@ async fn run_inner(
         session_path.clone(),
         initial_history.clone(),
         plan_mode,
+        no_color,
     );
 
     // Main loop. We poll three sources:

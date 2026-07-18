@@ -31,6 +31,46 @@ use ratatui::Frame;
 
 use super::app::{App, ChatEntry, RunPhase};
 
+/// Strip foreground/background colour from a style. Used when the
+/// user passes `--no-color` so screen readers, dumb terminals, and
+/// CI logs see clean text without ANSI escapes. Modifier (bold,
+/// italic) is preserved so the structural hierarchy stays
+/// readable in plain mode.
+fn strip_color(style: Style) -> Style {
+    Style::default()
+        .add_modifier(style.add_modifier)
+        .remove_modifier(style.sub_modifier)
+}
+
+/// Apply a style under the `no_color` axe-reader setting: when
+/// `no_color` is on, every coloured style is reduced to a
+/// colourless one with the same modifiers.
+fn apply(style: Style, no_color: bool) -> Style {
+    if no_color {
+        strip_color(style)
+    } else {
+        style
+    }
+}
+
+/// Drop foreground / background colour from every span in a line.
+/// Used at draw time so the renderer doesn't need to thread
+/// `no_color` through every `Span::styled` call.
+fn strip_line_colors(line: Line<'static>) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|s| Span::styled(s.content, strip_color(s.style)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Strip colours from a slice of lines in place. Cheap O(n) pass
+/// over the line count; we only do this once per frame.
+fn strip_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines.into_iter().map(strip_line_colors).collect()
+}
+
 /// Spinner frames used while the agent is running. 8-frame braille
 /// pattern — gentle motion without strobing.
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
@@ -67,12 +107,15 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(
             " crow ",
-            Style::default().bg(Color::Rgb(40, 80, 60)).fg(Color::White),
+            apply(
+                Style::default().bg(Color::Rgb(40, 80, 60)).fg(Color::White),
+                app.no_color,
+            ),
         ),
         Span::raw("  "),
         Span::styled(
             format!("model: {}", app.model_label),
-            Style::default().fg(Color::Cyan),
+            apply(Style::default().fg(Color::Cyan), app.no_color),
         ),
     ];
     if app.plan_mode {
@@ -81,16 +124,19 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             " PLAN ",
-            Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
+            apply(
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+                app.no_color,
+            ),
         ));
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         format!("session: {}", short_path(&app.session_path)),
-        Style::default().fg(Color::DarkGray),
+        apply(Style::default().fg(Color::DarkGray), app.no_color),
     ));
     let title = Line::from(spans);
     let block = Block::default()
@@ -104,7 +150,10 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// more `Line`s, then style them. Markdown rendering for assistant
 /// text is done in [`super::markdown`]; tool cards are styled here.
 fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let lines = render_history(app);
+    let mut lines = render_history(app);
+    if app.no_color {
+        lines = strip_lines(lines);
+    }
     // Vertical scroll: ratatui's Paragraph understands a `scroll`
     // offset (lines from the top). We anchor to the bottom by
     // default, and let the user scroll up with PageUp.
@@ -132,15 +181,10 @@ fn render_history(app: &App) -> Vec<Line<'static>> {
                 out.push(Line::raw(""));
             }
             ChatEntry::AssistantText(text) => {
-                // For v1 we render plain text. Markdown styling is a
-                // small follow-up; the structural shell is what
-                // matters today.
-                for line in text.split('\n') {
-                    out.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::White),
-                    )));
-                }
+                // Markdown rendering: bold/italic/inline-code/fenced
+                // code/lists come through our `markdown` module.
+                // Plain text falls through unchanged.
+                out.extend(super::markdown::render(text));
                 out.push(Line::raw(""));
             }
             ChatEntry::Reasoning(text) => {
@@ -170,6 +214,23 @@ fn render_history(app: &App) -> Vec<Line<'static>> {
                     format!(" {text}"),
                     Style::default().fg(Color::DarkGray),
                 )));
+            }
+            ChatEntry::ErrorBanner {
+                code,
+                retryable,
+                message,
+            } => {
+                // Red banner: visible after scrolling, easy to find
+                // when reviewing a failed run.
+                let retry = if *retryable { " (retryable)" } else { "" };
+                out.push(Line::from(Span::styled(
+                    format!(" ✗ {code}{retry}: {message} "),
+                    Style::default()
+                        .bg(Color::Red)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                out.push(Line::raw(""));
             }
         }
     }

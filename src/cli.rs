@@ -101,6 +101,13 @@ pub enum Command {
         /// commands. Matches Claude Code's plan mode UX.
         #[arg(long)]
         plan: bool,
+        /// Disable ANSI colour codes. Useful for screen readers,
+        /// piping into `less -R` (with `-R` removed), or terminals
+        /// that don't render colour reliably. The shape and
+        /// content of every widget stays the same; only the colour
+        /// attributes are stripped.
+        #[arg(long)]
+        no_color: bool,
     },
     /// Print the version string (same as --version).
     Version,
@@ -145,11 +152,15 @@ pub async fn run(args: Cli) -> Result<()> {
             let version = Arc::new(env!("CARGO_PKG_VERSION").to_string());
             crate::mcp_opencode::run(binary, version).await
         }
-        Command::Tui { resume, plan } => {
+        Command::Tui {
+            resume,
+            plan,
+            no_color,
+        } => {
             // Project root is taken from the resolved config so the
             // TUI operates on the same directory `crow exec` would.
             let project_root = config.project_root.clone();
-            crate::tui::run(config, resume, project_root, plan).await
+            crate::tui::run(config, resume, project_root, plan, no_color).await
         }
         Command::Version => {
             println!("crow {}", env!("CARGO_PKG_VERSION"));

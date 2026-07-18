@@ -121,6 +121,11 @@ pub struct App {
     /// registry is owned by the worker task and rebuild is
     /// non-trivial).
     pub plan_mode: bool,
+
+    /// Axe-reader lite: when true, the renderer skips colour
+    /// attributes so screen readers, dumb terminals, and CI logs
+    /// see clean text. Set from the `--no-color` CLI flag.
+    pub no_color: bool,
 }
 
 impl App {
@@ -131,6 +136,7 @@ impl App {
         session_path: PathBuf,
         history: Vec<crate::message::Message>,
         plan_mode: bool,
+        no_color: bool,
     ) -> Self {
         let mut app = Self {
             config: config.clone(),
@@ -156,6 +162,7 @@ impl App {
             allowlist: AllowList::new(),
             last_resolution: None,
             plan_mode,
+            no_color,
         };
         for msg in history {
             replay_message(&mut app, msg);
@@ -261,6 +268,14 @@ impl App {
                     if retryable { " (retryable)" } else { "" },
                     message
                 ));
+                // Surface the failure inline in the chat so the
+                // user sees it after scrolling, not just in the
+                // status bar.
+                self.history.push(ChatEntry::ErrorBanner {
+                    code: code.0,
+                    retryable,
+                    message,
+                });
             }
         }
     }
@@ -639,6 +654,17 @@ pub enum ChatEntry {
     },
     /// A short status line (slash-command output, info banners).
     StatusLine(String),
+    /// A red error banner pushed on `RunFailed`. Renders inline
+    /// with the chat so the failure is visible after scrolling,
+    /// not just in the status bar.
+    ErrorBanner {
+        /// Error code (e.g. `"stream_invalid"`).
+        code: String,
+        /// Whether the kernel marked this error retryable.
+        retryable: bool,
+        /// Human-readable failure message.
+        message: String,
+    },
 }
 
 /// In-flight tool state held between `ToolStarted` and
@@ -861,6 +887,7 @@ mod plan_mode_tests {
             PathBuf::from("/tmp/test.jsonl"),
             Vec::new(),
             false,
+            false,
         )
     }
 
@@ -872,8 +899,32 @@ mod plan_mode_tests {
 
     #[test]
     fn plan_mode_starts_on_when_requested() {
-        let app = App::new(test_config(), PathBuf::from("/tmp/x"), Vec::new(), true);
+        let app = App::new(
+            test_config(),
+            PathBuf::from("/tmp/x"),
+            Vec::new(),
+            true,
+            false,
+        );
         assert!(app.plan_mode);
+    }
+
+    #[test]
+    fn no_color_starts_off_by_default() {
+        let app = make_app();
+        assert!(!app.no_color);
+    }
+
+    #[test]
+    fn no_color_starts_on_when_requested() {
+        let app = App::new(
+            test_config(),
+            PathBuf::from("/tmp/x"),
+            Vec::new(),
+            false,
+            true,
+        );
+        assert!(app.no_color);
     }
 
     #[test]

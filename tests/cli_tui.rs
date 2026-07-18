@@ -52,3 +52,13 @@ fn tui_help_describes_plan_flag() {
         .success()
         .stdout(predicate::str::contains("--plan"));
 }
+
+#[test]
+fn tui_help_describes_no_color_flag() {
+    Command::cargo_bin("crow")
+        .unwrap()
+        .args(["tui", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-color"));
+}
