@@ -62,6 +62,7 @@ enum SlashCommand {
     Cost,
     Status,
     AddDir,
+    Compact,
 }
 
 impl SlashCommand {
@@ -77,6 +78,7 @@ impl SlashCommand {
             SlashCommand::Cost => "cost",
             SlashCommand::Status => "status",
             SlashCommand::AddDir => "add-dir",
+            SlashCommand::Compact => "compact",
             SlashCommand::Quit | SlashCommand::Exit => return SlashOutcome::Quit,
         };
         SlashOutcome::Local {
@@ -101,6 +103,7 @@ impl FromStr for SlashCommand {
             "cost" => Self::Cost,
             "status" => Self::Status,
             "add-dir" | "adddir" => Self::AddDir,
+            "compact" => Self::Compact,
             _ => return Err(()),
         })
     }

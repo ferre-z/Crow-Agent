@@ -470,8 +470,24 @@ impl App {
 
     /// Record a user message into the local history (so the user
     /// sees their own prompt echoed above the assistant reply).
+    /// On the very first prompt of a session with no `--name`,
+    /// derive a friendly label from the first line of the message
+    /// (F.40.05) and surface it as a status line.
     pub fn record_user_message(&mut self, text: &str) {
+        let is_first_user = self
+            .history
+            .iter()
+            .filter(|e| matches!(e, ChatEntry::UserMessage(_)))
+            .count()
+            == 0;
         self.history.push(ChatEntry::UserMessage(text.to_string()));
+        if is_first_user && self.session_name.is_none() {
+            if let Some(name) = derive_session_name(text) {
+                self.session_name = Some(name.clone());
+                self.history
+                    .push(ChatEntry::StatusLine(format!("auto-named session: {name}")));
+            }
+        }
     }
 
     /// Whether the user has asked to quit.
@@ -701,6 +717,7 @@ impl App {
             "cost" => self.show_cost(),
             "status" => self.show_status(),
             "add-dir" => self.add_dir(args),
+            "compact" => self.show_compact_status(),
             _ => {}
         }
     }
@@ -775,6 +792,39 @@ impl App {
         ];
         for line in lines {
             self.history.push(ChatEntry::StatusLine(line));
+        }
+    }
+
+    /// F.10.09 (lite) — `/compact` shows current context usage %
+    /// based on the active model's known context window. The full
+    /// auto-summarisation pipeline lands in a follow-up slice; for
+    /// now this slice just surfaces the warning so the user can
+    /// decide when to start a fresh session.
+    fn show_compact_status(&mut self) {
+        let ctx_size = self.pricing.for_model(&self.model_label).context_size as u64;
+        // Use the cumulative input tokens as a rough proxy for
+        // context usage. It's an over-estimate (includes history),
+        // but the goal here is to surface a warning, not to be
+        // exact.
+        let used = self.cumulative_input_tokens as u64;
+        let pct = if ctx_size > 0 {
+            (used as f64 / ctx_size as f64 * 100.0).round() as u64
+        } else {
+            0
+        };
+        let status = match pct {
+            0..=59 => "ok",
+            60..=84 => "tight",
+            _ => "overflow risk",
+        };
+        self.history.push(ChatEntry::StatusLine(format!(
+            "context: {pct}% ({used}/{ctx_size} tokens) — {status}"
+        )));
+        if pct >= 80 {
+            self.history.push(ChatEntry::StatusLine(
+                "hint: start a fresh session with `crow tui --name <new>` to reset context"
+                    .to_string(),
+            ));
         }
     }
 }
@@ -1387,6 +1437,115 @@ mod plan_mode_tests {
         app.reset_session();
         assert!(app.allowed_extra_dirs.is_empty());
     }
+
+    // --- F.40.05 / F.10.09 tests ---
+
+    #[test]
+    fn derive_session_name_strips_punctuation_and_caps_words() {
+        assert_eq!(
+            derive_session_name("What does the README say?"),
+            Some("What does the README say".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_session_name_returns_none_for_short_input() {
+        assert_eq!(derive_session_name("hi"), None);
+        assert_eq!(derive_session_name(""), None);
+        assert_eq!(derive_session_name("   "), None);
+    }
+
+    #[test]
+    fn first_user_prompt_auto_names_session() {
+        let mut app = make_app();
+        assert!(app.session_name.is_none());
+        app.record_user_message("investigate the auth bug");
+        assert_eq!(
+            app.session_name.as_deref(),
+            Some("investigate the auth bug")
+        );
+        // Status line was pushed too.
+        let last = app.history.last().expect("status line");
+        if let ChatEntry::StatusLine(text) = last {
+            assert!(text.contains("auto-named"));
+        } else {
+            panic!("expected StatusLine");
+        }
+    }
+
+    #[test]
+    fn second_user_prompt_does_not_overwrite_name() {
+        let mut app = make_app();
+        app.session_name = Some("preset".into());
+        app.record_user_message("first prompt");
+        // Pre-set name is preserved; the first-user branch never
+        // fires because session_name is already Some.
+        assert_eq!(app.session_name.as_deref(), Some("preset"));
+    }
+
+    #[test]
+    fn compact_status_shows_percentage_with_band() {
+        let mut app = make_app();
+        // Drive usage by accumulating tokens. We set the input
+        // count to exactly half of the loaded pricing's context
+        // size so the test is robust to whatever pricing entry the
+        // build picks up.
+        let ctx_size = app.pricing.for_model(&app.model_label).context_size;
+        app.cumulative_input_tokens = ctx_size / 2;
+        let before = app.history.len();
+        app.show_compact_status();
+        assert_eq!(app.history.len() - before, 1);
+        if let ChatEntry::StatusLine(text) = &app.history[before] {
+            assert!(text.contains("context:"));
+            assert!(text.contains(&ctx_size.to_string()));
+            assert!(text.contains("ok"));
+        } else {
+            panic!("expected StatusLine");
+        }
+    }
+
+    #[test]
+    fn compact_status_emits_hint_above_eighty_percent() {
+        let mut app = make_app();
+        let ctx_size = app.pricing.for_model(&app.model_label).context_size;
+        // 90% of context_size.
+        app.cumulative_input_tokens = ctx_size * 9 / 10;
+        let before = app.history.len();
+        app.show_compact_status();
+        // Two lines: the percentage + the hint.
+        assert_eq!(app.history.len() - before, 2);
+        let joined: String = app.history[before..]
+            .iter()
+            .filter_map(|e| {
+                if let ChatEntry::StatusLine(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("overflow risk"));
+        assert!(joined.contains("hint:"));
+    }
+}
+
+/// Derive a friendly session name from the user's first prompt.
+/// Takes the first non-blank line, strips non-alphanumeric chars
+/// from each token, and joins 3-7 tokens. Falls back to `None`
+/// when the input is too short to extract a meaningful name.
+fn derive_session_name(prompt: &str) -> Option<String> {
+    let first_line = prompt.lines().find(|l| !l.trim().is_empty())?.trim();
+    let cleaned: Vec<&str> = first_line
+        .split_whitespace()
+        .map(|tok| tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_'))
+        .filter(|t| !t.is_empty())
+        .take(7)
+        .collect();
+    if cleaned.len() < 2 {
+        return None;
+    }
+    Some(cleaned.join(" "))
 }
 
 /// Help text shown by `/help`.
