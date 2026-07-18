@@ -113,6 +113,29 @@ pub struct App {
     /// user can see what they just decided. Reset on each new ask.
     pub last_resolution: Option<String>,
 
+    /// Cumulative input tokens across every `ModelFinished` event
+    /// in this session. Powers the `tok in:N out:M` indicator in
+    /// the status bar (F.04.04).
+    pub cumulative_input_tokens: u32,
+
+    /// Cumulative output tokens across every `ModelFinished` event
+    /// in this session.
+    pub cumulative_output_tokens: u32,
+
+    /// Per-tool-call token usage since the last reset. Keys are
+    /// tool names (`"read"`, `"bash"`, ...); values are
+    /// `(input_tokens, output_tokens)`. Backs the per-tool
+    /// breakdown in `/cost` (F.10.08).
+    pub per_tool_tokens: std::collections::BTreeMap<String, (u32, u32)>,
+
+    /// Name of the tool currently executing, if any. Drives the
+    /// live tool timer in the status bar (F.04.03).
+    pub current_tool: Option<String>,
+
+    /// When the current tool started executing. `None` when idle.
+    /// Drives the live tool timer in the status bar (F.04.03).
+    pub current_tool_started_at: Option<std::time::Instant>,
+
     /// Plan mode flag. When true, the agent only has `read`
     /// available — it can inspect code but cannot mutate files
     /// or run shell commands. Set at startup from the `--plan`
@@ -161,6 +184,11 @@ impl App {
             pending_approval: None,
             allowlist: AllowList::new(),
             last_resolution: None,
+            cumulative_input_tokens: 0,
+            cumulative_output_tokens: 0,
+            per_tool_tokens: std::collections::BTreeMap::new(),
+            current_tool: None,
+            current_tool_started_at: None,
             plan_mode,
             no_color,
         };
@@ -202,13 +230,17 @@ impl App {
                 self.in_flight_tools.insert(
                     call_id,
                     PendingTool {
-                        name,
+                        name: name.clone(),
                         args,
                         stdout: String::new(),
                         stderr: String::new(),
                         finished: false,
                     },
                 );
+                // Track the active tool so the status bar can show
+                // a live timer (F.04.03).
+                self.current_tool = Some(name);
+                self.current_tool_started_at = Some(std::time::Instant::now());
             }
             AgentEvent::ToolOutput {
                 call_id,
@@ -234,6 +266,13 @@ impl App {
                     } => (message, true, truncated),
                 };
                 if let Some(pending) = pending {
+                    // Per-tool token bucket (F.10.08 — feeds /cost).
+                    let entry = self
+                        .per_tool_tokens
+                        .entry(pending.name.clone())
+                        .or_insert((0, 0));
+                    entry.0 = entry.0.saturating_add(self.cumulative_input_tokens);
+                    entry.1 = entry.1.saturating_add(self.cumulative_output_tokens);
                     self.history.push(ChatEntry::ToolCard {
                         name: pending.name,
                         args: pending.args,
@@ -244,8 +283,18 @@ impl App {
                         stderr: pending.stderr,
                     });
                 }
+                // Clear the active tool timer (F.04.03).
+                self.current_tool = None;
+                self.current_tool_started_at = None;
             }
             AgentEvent::ModelFinished { usage, stop_reason } => {
+                // Accumulate tokens for the status bar (F.04.04).
+                self.cumulative_input_tokens = self
+                    .cumulative_input_tokens
+                    .saturating_add(usage.input_tokens);
+                self.cumulative_output_tokens = self
+                    .cumulative_output_tokens
+                    .saturating_add(usage.output_tokens);
                 // Store usage on the most recent assistant text entry
                 // so the renderer can show token counts on hover (v1).
                 self.record_usage(usage, stop_reason);
@@ -949,6 +998,74 @@ mod plan_mode_tests {
         } else {
             panic!("expected StatusLine, got {last:?}");
         }
+    }
+
+    // --- F.04.04 token accumulation tests ---
+
+    fn usage(in_t: u32, out_t: u32) -> crate::event::Usage {
+        crate::event::Usage {
+            input_tokens: in_t,
+            output_tokens: out_t,
+        }
+    }
+
+    #[test]
+    fn model_finished_accumulates_tokens() {
+        let mut app = make_app();
+        assert_eq!(app.cumulative_input_tokens, 0);
+        assert_eq!(app.cumulative_output_tokens, 0);
+        app.apply_event(AgentEvent::ModelFinished {
+            usage: usage(100, 50),
+            stop_reason: crate::event::StopReason::EndTurn,
+        });
+        assert_eq!(app.cumulative_input_tokens, 100);
+        assert_eq!(app.cumulative_output_tokens, 50);
+        app.apply_event(AgentEvent::ModelFinished {
+            usage: usage(200, 75),
+            stop_reason: crate::event::StopReason::EndTurn,
+        });
+        assert_eq!(app.cumulative_input_tokens, 300);
+        assert_eq!(app.cumulative_output_tokens, 125);
+    }
+
+    // --- F.04.03 live tool timer tests ---
+
+    fn dummy_call_id() -> ToolCallId {
+        ToolCallId(crate::ids::new_id())
+    }
+
+    #[test]
+    fn tool_started_sets_current_tool_and_timestamp() {
+        let mut app = make_app();
+        assert!(app.current_tool.is_none());
+        let id = dummy_call_id();
+        app.apply_event(AgentEvent::ToolStarted {
+            call_id: id,
+            name: "bash".to_string(),
+            args: serde_json::json!({"command": "ls"}),
+        });
+        assert_eq!(app.current_tool.as_deref(), Some("bash"));
+        assert!(app.current_tool_started_at.is_some());
+    }
+
+    #[test]
+    fn tool_finished_clears_current_tool() {
+        let mut app = make_app();
+        let id = dummy_call_id();
+        app.apply_event(AgentEvent::ToolStarted {
+            call_id: id,
+            name: "bash".to_string(),
+            args: serde_json::json!({"command": "ls"}),
+        });
+        app.apply_event(AgentEvent::ToolFinished {
+            call_id: id,
+            result: crate::event::ToolOutcome::Success {
+                output: "ok".to_string(),
+                truncated: false,
+            },
+        });
+        assert!(app.current_tool.is_none());
+        assert!(app.current_tool_started_at.is_none());
     }
 }
 

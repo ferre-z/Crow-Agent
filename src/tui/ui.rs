@@ -292,6 +292,24 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(err) = &app.last_error {
         spans.push(Span::styled(err.clone(), Style::default().fg(Color::Red)));
     }
+    // F.04.03 — live tool timer.
+    if let (Some(name), Some(started)) = (&app.current_tool, app.current_tool_started_at) {
+        let elapsed = started.elapsed().as_secs();
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(
+            format!("{name} {elapsed}s"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    // F.04.04 — cumulative token counts.
+    spans.push(Span::raw("    "));
+    spans.push(Span::styled(
+        format!(
+            "tok in:{} out:{}",
+            app.cumulative_input_tokens, app.cumulative_output_tokens
+        ),
+        Style::default().fg(Color::DarkGray),
+    ));
     spans.push(Span::raw("    "));
     spans.push(Span::styled(
         format!("session {}", short_session_id(&app.session_id)),
