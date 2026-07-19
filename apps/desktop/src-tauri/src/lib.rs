@@ -248,12 +248,22 @@ pub fn run() {
             let state: AppState = Arc::new(Inner::default());
             app.manage(Arc::clone(&state));
 
-            // Spawn `crow serve` as a sidecar and start the reader task.
+            // Spawn the crow-desktop-bridge.js subprocess via
+            // the platform shell. The bridge speaks the desktop's
+            // existing JSON-RPC contract on stdin/stdout and
+            // drives `pi --mode rpc` under the hood. We use the
+            // shell command builder (not the sidecar mechanism)
+            // because the bridge is a plain Node.js script — no
+            // need to bundle it as an externalBin.
+            let bridge_path = std::path::PathBuf::from("../crow-desktop-bridge.js");
             let (rx, child) = app
                 .handle()
                 .shell()
-                .sidecar("crow")?
-                .args(["serve"])
+                .command("node")
+                .args([
+                    bridge_path.to_string_lossy().to_string(),
+                ])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
                 .spawn()?;
             {
                 let mut guard = state.child.lock().expect("state poisoned");
