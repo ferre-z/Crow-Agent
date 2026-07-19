@@ -1,9 +1,23 @@
+# Rust build outputs (kept for apps/desktop, ignored elsewhere)
 target/
+Cargo.lock
+
+# Node / pi-crow
+pi-crow/node_modules/
+pi-crow/packages/*/node_modules/
+pi-crow/packages/*/dist/
+.pi-test/
+
+# Crow runtime state
+.crow/
+.crow-test/
+
+# Existing ignores
 .worktrees/
 *.log
 .env
 .env.local
 .review-packages/
-# Crow runtime state — sessions, doctor cache, anything the agent
-# writes under the project root. Per-user, never committed.
-.crow/
+
+# OS
+.DS_Store
