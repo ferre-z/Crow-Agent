@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #0a0f0a; /* app background */
+  --color-ink-1: #0e150e; /* panel background */
+  --color-ink-2: #141d14; /* raised surface */
+  --color-line: #1f2c1f; /* borders */
+  --color-crow: #4ade80; /* accent */
+  --color-crow-dim: #2f9e5c;
+  --color-fg: #d3dfd3; /* primary text */
+  --color-fg-dim: #7d907d; /* secondary text */
+  --color-danger: #f87171;
+  --color-warn: #fbbf24;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink);
+  color: var(--color-fg);
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  font-size: 14px;
+}
+
+code,
+pre,
+textarea.font-mono,
+input.font-mono {
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}

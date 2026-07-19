@@ -6,9 +6,10 @@ Crow is a pnpm monorepo (TypeScript strict, ESM/NodeNext). Shared wire types
 live in `packages/protocol` (`@crow/protocol`); the agent runtime on the pi
 SDK lives in `packages/core` (`@crow/core`); custom memory in
 `packages/memory` (`@crow/memory`); the per-host daemon in `packages/daemon`
-(`@crow/daemon`, binary `crowd`). Apps live under `apps/` (`desktop` Electron
-hub, `cli` thin client). Bundled skills live in `skills/`, design history and
-the protocol spec in `docs/`, utility scripts in `scripts/`.
+(`@crow/daemon`, binary `crowd`); the typed daemon client in
+`packages/client` (`@crow/client`). Apps live under `apps/` (`desktop`
+Electron hub, `cli` thin client). Bundled skills live in `skills/`, design
+history and the protocol spec in `docs/`, utility scripts in `scripts/`.
 
 Unit tests are colocated as `*.test.ts` next to sources. Keep modules narrow;
 expose public APIs through each package's `src/index.ts`.
