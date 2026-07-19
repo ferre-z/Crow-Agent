@@ -10,7 +10,11 @@ import { isValidThinkingLevel } from "../cli/args.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 
-/** Default model IDs for each known provider */
+/** Default model IDs for each known provider.
+ *  Crow ships with Nemotron 3 Ultra as the default NVIDIA model
+ *  (the project's target reasoning model). All other defaults
+ *  are upstream pi values; we only override the NVIDIA entry.
+ */
 export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
 	"ant-ling": "Ring-2.6-1T",
@@ -19,7 +23,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"azure-openai-responses": "gpt-5.4",
 	"openai-codex": "gpt-5.5",
 	radius: "auto",
-	nvidia: "nvidia/nemotron-3-super-120b-a12b",
+	nvidia: "nvidia/nemotron-3-ultra-550b-a55b",
 	deepseek: "deepseek-v4-pro",
 	google: "gemini-3.1-pro-preview",
 	"google-vertex": "gemini-3.1-pro-preview",

@@ -359,10 +359,29 @@ export class SettingsManager {
 		});
 
 		if (!content) {
+			// Crow ships NVIDIA-first defaults. When the user has no
+			// settings.json yet (typical first launch), seed it with
+			// Nemotron 3 Ultra + a Crow default theme. The user can
+			// override anything via /settings.
+			if (scope === "global") {
+				return SettingsManager.crowDefaultGlobalSettings();
+			}
 			return {};
 		}
 		const settings = JSON.parse(content);
 		return SettingsManager.migrateSettings(settings);
+	}
+
+	/// Crow-first-launch defaults. Applied only when the user has
+	/// no `~/.pi/agent/settings.json` yet; existing settings win.
+	/// Keeps the rest of the schema at their upstream defaults so
+	/// Crow only diverges where it intentionally wants to.
+	static crowDefaultGlobalSettings(): Settings {
+		return {
+			defaultProvider: "nvidia",
+			defaultModel: "nvidia/nemotron-3-ultra-550b-a55b",
+			theme: "crow/dark",
+		} as Settings;
 	}
 
 	private static tryLoadFromStorage(
