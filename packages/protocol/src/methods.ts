@@ -20,12 +20,23 @@ export const modelRefSchema = z
   .regex(/^[^/]+\/.+$/, "model ref must be 'provider/modelId'");
 export type ModelRef = z.infer<typeof modelRefSchema>;
 
+/**
+ * Tool-call approval mode: "auto" executes everything immediately (default,
+ * pre-P2 behavior); "ask" pauses each tool call until an attached client
+ * answers via `approval.respond` (or the approval times out).
+ */
+export const approvalModeSchema = z.enum(["auto", "ask"]);
+export type ApprovalMode = z.infer<typeof approvalModeSchema>;
+
 // --- session.create ---
 export const sessionCreateParamsSchema = z.object({
   cwd: z.string().min(1),
   model: modelRefSchema.optional(),
   systemPrompt: z.string().optional(),
   skillDirs: z.array(z.string()).optional(),
+  approvalMode: approvalModeSchema.optional(),
+  /** Tool names that never ask, even in "ask" mode. Defaults to []. */
+  autoApproveTools: z.array(z.string()).optional(),
 });
 export type SessionCreateParams = z.infer<typeof sessionCreateParamsSchema>;
 
@@ -54,6 +65,7 @@ export const sessionInfoSchema = z.object({
   model: modelRefSchema.nullable(),
   state: z.enum(["idle", "busy"]),
   createdAt: z.string(),
+  approvalMode: approvalModeSchema,
 });
 export type SessionInfo = z.infer<typeof sessionInfoSchema>;
 
@@ -91,3 +103,22 @@ export const methodParamsSchemas = {
   [METHODS.SESSION_ATTACH]: sessionAttachParamsSchema,
   [METHODS.HOST_INFO]: z.object({}).strict(),
 } as const;
+
+// --- approval.respond (client → daemon notification, no id, no response) ---
+
+/**
+ * Client notifications (client → daemon, no `id`, never answered). Kept out of
+ * METHODS/methodParamsSchemas, which drive request dispatch.
+ */
+export const NOTIFICATIONS = {
+  APPROVAL_RESPOND: "approval.respond",
+} as const;
+
+export const approvalDecisionSchema = z.enum(["allow", "deny", "always"]);
+export type ApprovalDecision = z.infer<typeof approvalDecisionSchema>;
+
+export const approvalRespondParamsSchema = z.object({
+  approvalId: z.string().min(1),
+  decision: approvalDecisionSchema,
+});
+export type ApprovalRespondParams = z.infer<typeof approvalRespondParamsSchema>;

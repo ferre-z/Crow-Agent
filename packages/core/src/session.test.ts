@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CrowSessionManager, type CrowSessionEvent } from "./session.ts";
+import type { ApprovalRequest } from "./approvals.ts";
 import {
   FAUX_MODEL_REF,
   fauxAssistantMessage,
@@ -151,5 +152,126 @@ describe("CrowSessionManager", () => {
     const last = events.at(-1);
     expect(last).toMatchObject({ type: "state", state: "error" });
     expect(session.getInfo().state).toBe("error");
+  });
+});
+
+describe("CrowSession approvals", () => {
+  let tmp: string;
+  let workdir: string;
+  let sessionsRoot: string;
+  let manager: CrowSessionManager | undefined;
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(path.join(os.tmpdir(), "crow-approvals-"));
+    workdir = path.join(tmp, "work");
+    await mkdir(workdir, { recursive: true });
+    sessionsRoot = path.join(tmp, "sessions");
+  });
+
+  afterEach(async () => {
+    await manager?.shutdown();
+    await rm(tmp, { recursive: true, force: true });
+  });
+
+  it("runs the tool after an allow decision and reports the mode in getInfo", async () => {
+    await writeFile(path.join(workdir, "hello.txt"), "hello from disk");
+    const { models, faux } = makeFauxModels();
+    manager = new CrowSessionManager({ sessionsRoot, models, defaultModelRef: FAUX_MODEL_REF });
+
+    const requests: ApprovalRequest[] = [];
+    const session = await manager.create({
+      cwd: workdir,
+      approvalMode: "ask",
+      approvalAsk: (req) => {
+        requests.push(req);
+        return Promise.resolve("allow");
+      },
+    });
+    expect(session.getInfo().approvalMode).toBe("ask");
+
+    const events: CrowSessionEvent[] = [];
+    session.subscribe((e) => events.push(e));
+
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("read", { path: "hello.txt" })], {
+        stopReason: "toolUse",
+      }),
+      fauxAssistantMessage([fauxText("done reading")]),
+    ]);
+
+    await session.prompt("read the file");
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ tool: "read", args: { path: "hello.txt" } });
+    expect(requests[0]?.callId).toBeTruthy();
+    const toolResult = events.find((e) => e.type === "tool_result");
+    expect(toolResult).toMatchObject({ tool: "read", isError: false });
+    expect(events.at(-1)).toEqual({ type: "state", state: "idle" });
+    expect(faux.state.callCount).toBe(2);
+  });
+
+  it("blocks the tool after a deny decision and the agent gets the reason", async () => {
+    const { models, faux } = makeFauxModels();
+    manager = new CrowSessionManager({ sessionsRoot, models, defaultModelRef: FAUX_MODEL_REF });
+
+    const session = await manager.create({
+      cwd: workdir,
+      approvalMode: "ask",
+      approvalAsk: () => Promise.resolve("deny"),
+    });
+
+    const events: CrowSessionEvent[] = [];
+    session.subscribe((e) => events.push(e));
+
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("read", { path: "hello.txt" })], {
+        stopReason: "toolUse",
+      }),
+      fauxAssistantMessage([fauxText("understood, I will not read it")]),
+    ]);
+
+    await session.prompt("read the file");
+
+    const toolResult = events.find((e) => e.type === "tool_result");
+    expect(toolResult).toMatchObject({ tool: "read", isError: true });
+    expect(toolResult && toolResult.type === "tool_result" ? toolResult.output : "").toContain(
+      "denied by user",
+    );
+    // The loop continues: the model sees the error tool result and answers.
+    expect(events.at(-1)).toEqual({ type: "state", state: "idle" });
+    expect(faux.state.callCount).toBe(2);
+  });
+
+  it("never asks in auto mode, even with an approver injected", async () => {
+    await writeFile(path.join(workdir, "hello.txt"), "hello from disk");
+    const { models, faux } = makeFauxModels();
+    manager = new CrowSessionManager({ sessionsRoot, models, defaultModelRef: FAUX_MODEL_REF });
+
+    let asked = 0;
+    const session = await manager.create({
+      cwd: workdir,
+      approvalAsk: () => {
+        asked += 1;
+        return Promise.resolve("deny");
+      },
+    });
+    expect(session.getInfo().approvalMode).toBe("auto");
+
+    const events: CrowSessionEvent[] = [];
+    session.subscribe((e) => events.push(e));
+
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("read", { path: "hello.txt" })], {
+        stopReason: "toolUse",
+      }),
+      fauxAssistantMessage([fauxText("done")]),
+    ]);
+
+    await session.prompt("read the file");
+
+    expect(asked).toBe(0);
+    const toolResult = events.find((e) => e.type === "tool_result");
+    expect(toolResult).toMatchObject({ tool: "read", isError: false });
+    expect(events.at(-1)).toEqual({ type: "state", state: "idle" });
   });
 });

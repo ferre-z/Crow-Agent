@@ -8,6 +8,12 @@ import {
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { Models, TextContent } from "@earendil-works/pi-ai";
 
+import {
+  ApprovalGate,
+  type ApprovalAsk,
+  type ApprovalCheckResult,
+  type ApprovalMode,
+} from "./approvals.ts";
 import { ConfinedExecutionEnv } from "./env/confined-env.ts";
 import { DEFAULT_MODEL_REF, resolveModelRef } from "./models.ts";
 import { buildSystemPrompt, loadCrowSkills } from "./skills.ts";
@@ -34,6 +40,7 @@ export interface CrowSessionInfo {
   modelRef: string;
   state: CrowSessionState;
   createdAt: string;
+  approvalMode: ApprovalMode;
 }
 
 /** Tool outputs are capped before hitting the wire; full output stays in the session log. */
@@ -51,6 +58,8 @@ export class CrowSession {
   private readonly harness: AgentHarness;
   private readonly listeners = new Set<CrowSessionListener>();
   private readonly unsubscribeHarness: () => void;
+  private readonly unsubscribeApproval: () => void;
+  private readonly approvalGate: ApprovalGate;
   private state: CrowSessionState = "idle";
 
   constructor(options: {
@@ -59,12 +68,33 @@ export class CrowSession {
     harness: AgentHarness;
     modelRef: string;
     createdAt?: string;
+    approvalGate?: ApprovalGate;
   }) {
     this.id = options.id;
     this.cwd = options.cwd;
     this.harness = options.harness;
     this.modelRef = options.modelRef;
     this.createdAt = options.createdAt ?? new Date().toISOString();
+    this.approvalGate = options.approvalGate ?? new ApprovalGate();
+    // The tool_call hook is an interceptor (subscribe() never sees it): in
+    // "ask" mode the gate pauses each tool call here until the approver
+    // answers. In "auto" mode check() resolves allow immediately, so this is
+    // behavior-preserving. It is independent of the tool_execution_* pair
+    // mapped to session events below — those still fire for blocked calls
+    // (the block surfaces as an error tool_result with the deny reason).
+    this.unsubscribeApproval = this.harness.on("tool_call", async (event) => {
+      let result: ApprovalCheckResult;
+      try {
+        result = await this.approvalGate.check(event.toolCallId, event.toolName, event.input);
+      } catch (error) {
+        // A broken approver must not wedge the run; deny the call instead.
+        const message = error instanceof Error ? error.message : String(error);
+        return { block: true, reason: `approval failed: ${message}` };
+      }
+      return result.allow
+        ? undefined
+        : { block: true, reason: result.reason ?? "tool call not approved" };
+    });
     // One harness subscription for the session lifetime. The listener is
     // synchronous and returns void, so harness fan-out never awaits us; crow
     // listeners are sync void by contract and each call is guarded.
@@ -176,11 +206,13 @@ export class CrowSession {
       modelRef: this.modelRef,
       state: this.state,
       createdAt: this.createdAt,
+      approvalMode: this.approvalGate.mode,
     };
   }
 
   async close(): Promise<void> {
     this.unsubscribeHarness();
+    this.unsubscribeApproval();
     this.listeners.clear();
     await this.harness.env.cleanup();
   }
@@ -197,6 +229,15 @@ export interface CreateSessionOptions {
   modelRef?: string;
   systemPrompt?: string;
   skillDirs?: string[];
+  /** Tool-call approval mode; defaults to "auto" (everything runs). */
+  approvalMode?: ApprovalMode;
+  /** Tool names that never ask, even in "ask" mode. */
+  autoApproveTools?: string[];
+  /**
+   * Approver callback for "ask" mode, injected by the daemon (fans out to
+   * attached clients). Ignored in "auto" mode.
+   */
+  approvalAsk?: ApprovalAsk;
 }
 
 export class CrowSessionManager {
@@ -236,12 +277,20 @@ export class CrowSessionManager {
       systemPrompt,
     });
     const metadata = await session.getMetadata();
+    const approvalGate = new ApprovalGate({
+      ...(options.approvalMode !== undefined ? { mode: options.approvalMode } : {}),
+      ...(options.autoApproveTools !== undefined
+        ? { autoApproveTools: options.autoApproveTools }
+        : {}),
+      ...(options.approvalAsk !== undefined ? { ask: options.approvalAsk } : {}),
+    });
     const crowSession = new CrowSession({
       id: metadata.id,
       cwd: options.cwd,
       harness,
       modelRef,
       createdAt: metadata.createdAt,
+      approvalGate,
     });
     this.sessions.set(crowSession.id, crowSession);
     return crowSession;

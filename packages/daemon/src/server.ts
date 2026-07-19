@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -5,12 +6,16 @@ import {
   CrowSessionManager,
   createCrowModels,
   DEFAULT_MODEL_REF,
+  type ApprovalDecision,
+  type ApprovalRequest,
+  type ApprovalVerdict,
   type CrowSession,
   type CrowSessionEvent,
   type CrowSessionInfo,
   type Models,
 } from "@crow/core";
 import {
+  approvalRespondParamsSchema,
   encodeFrame,
   EVENTS,
   jsonRpcFrameSchema,
@@ -19,10 +24,13 @@ import {
   makeResult,
   METHODS,
   methodParamsSchemas,
+  NOTIFICATIONS,
   PROTOCOL_VERSION,
   RPC_ERRORS,
+  type ApprovalRespondParams,
   type HostInfoResult,
   type JsonRpcFrame,
+  type JsonRpcNotification,
   type JsonRpcRequest,
   type RequestId,
   type SessionAttachParams,
@@ -34,6 +42,9 @@ import {
 import { WebSocket, WebSocketServer } from "ws";
 
 export const DAEMON_VERSION = "0.1.0" as const;
+
+/** Default time a tool call waits for an approval.respond before being denied. */
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 120_000;
 
 /** Close policy for a runaway NDJSON accumulator (no newline seen). */
 const MAX_BUFFER_BYTES = 1024 * 1024;
@@ -56,12 +67,21 @@ export interface CrowDaemonOptions {
   /** Injectable for tests (e.g. the faux provider); defaults to all built-in providers. */
   models?: Models;
   defaultModelRef?: string;
+  /** How long a tool call waits for approval.respond; defaults to 120 s. */
+  approvalTimeoutMs?: number;
 }
 
 interface ConnectionState {
   ws: WebSocket;
   attachedSessionIds: Set<string>;
   buffer: string;
+}
+
+/** One tool call paused waiting for a client's approval.respond. */
+interface PendingApproval {
+  sessionId: string;
+  resolve: (verdict: ApprovalDecision | ApprovalVerdict) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 /** Map the richer crow session state onto the wire's coarse idle/busy. */
@@ -72,6 +92,7 @@ function toWireSessionInfo(info: CrowSessionInfo): SessionInfo {
     model: info.modelRef,
     state: info.state === "streaming" ? "busy" : "idle",
     createdAt: info.createdAt,
+    approvalMode: info.approvalMode,
   };
 }
 
@@ -80,6 +101,7 @@ export class CrowDaemon {
   private readonly manager: CrowSessionManager;
   private readonly connections = new Set<ConnectionState>();
   private readonly sessionSubscriptions = new Map<string, () => void>();
+  private readonly pendingApprovals = new Map<string, PendingApproval>();
   private wss: WebSocketServer | undefined;
 
   constructor(options: CrowDaemonOptions) {
@@ -123,6 +145,13 @@ export class CrowDaemon {
       unsubscribe();
     }
     this.sessionSubscriptions.clear();
+    // Unblock any tool calls still waiting on an approval so their sessions
+    // can settle instead of hanging until the timeout fires.
+    for (const [approvalId, pending] of this.pendingApprovals) {
+      clearTimeout(pending.timer);
+      pending.resolve({ decision: "deny", reason: "daemon shutting down" });
+      this.pendingApprovals.delete(approvalId);
+    }
     await this.manager.shutdown();
     await new Promise<void>((resolve) => {
       if (!this.wss) {
@@ -178,8 +207,68 @@ export class CrowDaemon {
     }
     const frame = parsed.data;
     if (!("method" in frame)) return; // responses from clients: ignore
-    if (!("id" in frame)) return; // notifications: ignored in P1 (reserved for approval.respond)
+    if (!("id" in frame)) {
+      this.onNotification(conn, frame);
+      return;
+    }
     void this.dispatch(conn, frame);
+  }
+
+  /** Client notifications never get a response frame; malformed ones are dropped. */
+  private onNotification(conn: ConnectionState, notification: JsonRpcNotification): void {
+    if (notification.method !== NOTIFICATIONS.APPROVAL_RESPOND) return;
+    const parsed = approvalRespondParamsSchema.safeParse(notification.params ?? {});
+    if (!parsed.success) return;
+    this.onApprovalRespond(conn, parsed.data);
+  }
+
+  private onApprovalRespond(conn: ConnectionState, params: ApprovalRespondParams): void {
+    const pending = this.pendingApprovals.get(params.approvalId);
+    if (!pending) return; // unknown or already resolved/expired: ignore
+    if (!conn.attachedSessionIds.has(pending.sessionId)) return; // not your session
+    clearTimeout(pending.timer);
+    this.pendingApprovals.delete(params.approvalId);
+    pending.resolve(params.decision);
+  }
+
+  /**
+   * ApprovalGate `ask` callback for a session in "ask" mode: fan an
+   * `event.approval_request` out to every attached connection and wait for
+   * the matching `approval.respond`. Denies when nobody is attached and on
+   * timeout; callers see the verdict (with the deny reason) via the gate.
+   */
+  private askForApproval(
+    sessionId: string,
+    request: ApprovalRequest,
+  ): Promise<ApprovalDecision | ApprovalVerdict> {
+    const targets = [...this.connections].filter(
+      (conn) => conn.attachedSessionIds.has(sessionId) && conn.ws.readyState === WebSocket.OPEN,
+    );
+    if (targets.length === 0) {
+      return Promise.resolve({ decision: "deny", reason: "no client attached to approve" });
+    }
+    const approvalId = `appr_${randomUUID()}`;
+    const frame = encodeFrame(
+      makeNotification(EVENTS.APPROVAL_REQUEST, {
+        sessionId,
+        approvalId,
+        callId: request.callId,
+        tool: request.tool,
+        args: request.args,
+      }),
+    );
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingApprovals.delete(approvalId);
+        resolve({ decision: "deny", reason: "approval timed out" });
+      }, this.options.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS);
+      // The daemon must be stoppable (and tests exitable) with approvals pending.
+      timer.unref();
+      this.pendingApprovals.set(approvalId, { sessionId, resolve, timer });
+      for (const conn of targets) {
+        conn.ws.send(frame);
+      }
+    });
   }
 
   private async dispatch(conn: ConnectionState, request: JsonRpcRequest): Promise<void> {
@@ -216,12 +305,19 @@ export class CrowDaemon {
     switch (method) {
       case METHODS.SESSION_CREATE: {
         const p = params as SessionCreateParams;
+        // The gate's ask callback only fires once the session is prompting,
+        // so closing over `sessionId` before it is assigned below is safe.
+        let sessionId = "";
         const session = await this.manager.create({
           cwd: p.cwd,
           modelRef: p.model,
           systemPrompt: p.systemPrompt,
           skillDirs: p.skillDirs,
+          approvalMode: p.approvalMode,
+          autoApproveTools: p.autoApproveTools,
+          approvalAsk: (req) => this.askForApproval(sessionId, req),
         });
+        sessionId = session.id;
         this.ensureSessionSubscription(session);
         // The creator is implicitly attached to its own session's events.
         conn.attachedSessionIds.add(session.id);

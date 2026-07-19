@@ -9,6 +9,17 @@ export const CORE_VERSION = "0.1.0" as const;
 
 export { ConfinedExecutionEnv } from "./env/confined-env.ts";
 export {
+  ApprovalGate,
+  DEFAULT_DENY_REASON,
+  type ApprovalAsk,
+  type ApprovalCheckResult,
+  type ApprovalDecision,
+  type ApprovalGateOptions,
+  type ApprovalMode,
+  type ApprovalRequest,
+  type ApprovalVerdict,
+} from "./approvals.ts";
+export {
   createBashTool,
   createCodingTools,
   createEditTool,

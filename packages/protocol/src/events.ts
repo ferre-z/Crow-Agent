@@ -10,6 +10,7 @@ export const EVENTS = {
   TOOL_CALL: "event.tool_call",
   TOOL_RESULT: "event.tool_result",
   SESSION_STATE: "event.session_state",
+  APPROVAL_REQUEST: "event.approval_request",
 } as const;
 
 export const sessionStateSchema = z.enum(["idle", "streaming", "error"]);
@@ -51,6 +52,20 @@ export const sessionStateEventSchema = z.object({
 });
 export type SessionStateEvent = z.infer<typeof sessionStateEventSchema>;
 
+/**
+ * Sent for each tool call that needs approval (session in "ask" mode). The
+ * daemon holds the tool call until a client answers with an `approval.respond`
+ * notification carrying this `approvalId`, or the approval times out.
+ */
+export const approvalRequestEventSchema = z.object({
+  sessionId: z.string(),
+  approvalId: z.string(),
+  callId: z.string(),
+  tool: z.string(),
+  args: z.unknown(),
+});
+export type ApprovalRequestEvent = z.infer<typeof approvalRequestEventSchema>;
+
 /** Params validator per event method. */
 export const eventParamsSchemas = {
   [EVENTS.TOKEN]: tokenEventSchema,
@@ -58,4 +73,5 @@ export const eventParamsSchemas = {
   [EVENTS.TOOL_CALL]: toolCallEventSchema,
   [EVENTS.TOOL_RESULT]: toolResultEventSchema,
   [EVENTS.SESSION_STATE]: sessionStateEventSchema,
+  [EVENTS.APPROVAL_REQUEST]: approvalRequestEventSchema,
 } as const;

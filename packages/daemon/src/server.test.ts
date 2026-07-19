@@ -6,8 +6,10 @@ import { testing } from "@crow/core";
 import {
   encodeFrame,
   EVENTS,
+  makeNotification,
   makeRequest,
   METHODS,
+  NOTIFICATIONS,
   PROTOCOL_VERSION,
   RPC_ERRORS,
 } from "@crow/protocol";
@@ -29,6 +31,7 @@ interface TestClient {
   notifications: CollectedFrame[];
   responses: CollectedFrame[];
   call(method: string, params?: unknown): Promise<unknown>;
+  notify(method: string, params?: unknown): void;
   sendRaw(raw: string): void;
   close(): Promise<void>;
 }
@@ -94,6 +97,9 @@ function makeClient(ws: WebSocket): TestClient {
         ws.send(encodeFrame(makeRequest(id, method, params)));
       });
     },
+    notify(method, params) {
+      ws.send(encodeFrame(makeNotification(method, params)));
+    },
     sendRaw(raw) {
       ws.send(raw);
     },
@@ -110,10 +116,10 @@ function makeClient(ws: WebSocket): TestClient {
   };
 }
 
-const waitFor = (cond: () => boolean, description: string) =>
+const waitFor = (cond: () => boolean | Promise<boolean>, description: string) =>
   vi.waitFor(
-    () => {
-      if (!cond()) throw new Error(`still waiting: ${description}`);
+    async () => {
+      if (!(await cond())) throw new Error(`still waiting: ${description}`);
     },
     { timeout: 8000, interval: 25 },
   );
@@ -284,5 +290,277 @@ describe("CrowDaemon", () => {
     await expect(
       b.call(METHODS.SESSION_ATTACH, { sessionId: "no-such-session" }),
     ).rejects.toMatchObject({ code: RPC_ERRORS.SESSION_NOT_FOUND });
+  });
+
+  describe("tool-call approvals", () => {
+    const createAskSession = async (client: TestClient, extra?: Record<string, unknown>) => {
+      const created = (await client.call(METHODS.SESSION_CREATE, {
+        cwd: workdir,
+        approvalMode: "ask",
+        ...extra,
+      })) as { sessionId: string };
+      return created.sessionId;
+    };
+
+    const nextApprovalRequest = async (client: TestClient) => {
+      await waitFor(
+        () => client.notifications.some((n) => n.method === EVENTS.APPROVAL_REQUEST),
+        "event.approval_request",
+      );
+      return client.notifications.find((n) => n.method === EVENTS.APPROVAL_REQUEST);
+    };
+
+    const waitForIdle = async (client: TestClient) => {
+      await waitFor(
+        () =>
+          client.notifications.some(
+            (n) => n.method === EVENTS.SESSION_STATE && n.params?.state === "idle",
+          ),
+        "session_state idle",
+      );
+    };
+
+    it("asks attached clients and runs the tool on allow", { timeout: 15000 }, async () => {
+      await writeFile(path.join(workdir, "hello.txt"), "hello from disk");
+      faux.setResponses([
+        testing.fauxAssistantMessage([testing.fauxToolCall("read", { path: "hello.txt" })], {
+          stopReason: "toolUse",
+        }),
+        testing.fauxAssistantMessage([testing.fauxText("approved and read")]),
+      ]);
+      const client = await openClient();
+      const sessionId = await createAskSession(client);
+
+      await client.call(METHODS.SESSION_SEND, { sessionId, text: "read the file" });
+
+      const approval = await nextApprovalRequest(client);
+      expect(approval?.params).toMatchObject({
+        sessionId,
+        tool: "read",
+        args: { path: "hello.txt" },
+      });
+      expect(String(approval?.params?.approvalId)).toMatch(/^appr_/);
+      // The request carries the same callId as the event.tool_call that
+      // preceded it, so clients can correlate the two.
+      const toolCall = client.notifications.find((n) => n.method === EVENTS.TOOL_CALL);
+      expect(approval?.params?.callId).toBe(toolCall?.params?.callId);
+
+      client.notify(NOTIFICATIONS.APPROVAL_RESPOND, {
+        approvalId: approval?.params?.approvalId,
+        decision: "allow",
+      });
+
+      await waitForIdle(client);
+      const toolResults = client.notifications.filter((n) => n.method === EVENTS.TOOL_RESULT);
+      expect(toolResults).toHaveLength(1);
+      expect(toolResults[0]?.params).toMatchObject({ tool: "read", isError: false });
+      expect(String(toolResults[0]?.params?.output)).toContain("hello from disk");
+      const tokens = client.notifications
+        .filter((n) => n.method === EVENTS.TOKEN)
+        .map((n) => String(n.params?.text ?? ""))
+        .join("");
+      expect(tokens).toContain("approved and read");
+      // The tool ran exactly once, so exactly one approval was requested.
+      expect(client.notifications.filter((n) => n.method === EVENTS.APPROVAL_REQUEST)).toHaveLength(
+        1,
+      );
+    });
+
+    it(
+      "blocks the tool on deny and the agent receives the reason",
+      { timeout: 15000 },
+      async () => {
+        let followUpMessages: unknown;
+        faux.setResponses([
+          testing.fauxAssistantMessage([testing.fauxToolCall("read", { path: "hello.txt" })], {
+            stopReason: "toolUse",
+          }),
+          (context) => {
+            followUpMessages = context.messages;
+            return testing.fauxAssistantMessage([testing.fauxText("ok, not reading it")]);
+          },
+        ]);
+        const client = await openClient();
+        const sessionId = await createAskSession(client);
+
+        await client.call(METHODS.SESSION_SEND, { sessionId, text: "read the file" });
+        const approval = await nextApprovalRequest(client);
+        client.notify(NOTIFICATIONS.APPROVAL_RESPOND, {
+          approvalId: approval?.params?.approvalId,
+          decision: "deny",
+        });
+
+        await waitForIdle(client);
+        const toolResults = client.notifications.filter((n) => n.method === EVENTS.TOOL_RESULT);
+        expect(toolResults).toHaveLength(1);
+        expect(toolResults[0]?.params).toMatchObject({ tool: "read", isError: true });
+        expect(String(toolResults[0]?.params?.output)).toContain("denied by user");
+        // The loop continued: the follow-up LLM call saw the error tool result.
+        expect(faux.state.callCount).toBe(2);
+        expect(JSON.stringify(followUpMessages)).toContain("denied by user");
+      },
+    );
+
+    it("denies the call when the approval times out", { timeout: 15000 }, async () => {
+      const timeoutDir = await mkdtemp(path.join(os.tmpdir(), "crowd-approval-timeout-"));
+      const timeoutWorkdir = path.join(timeoutDir, "work");
+      await mkdir(timeoutWorkdir, { recursive: true });
+      const made = testing.makeFauxModels();
+      const shortFuse = new CrowDaemon({
+        host: "127.0.0.1",
+        port: 0,
+        token: "test-token",
+        dataDir: timeoutDir,
+        models: made.models,
+        defaultModelRef: testing.FAUX_MODEL_REF,
+        approvalTimeoutMs: 50,
+      });
+      const { port: timeoutPort } = await shortFuse.start();
+      const client = makeClient(await connect(timeoutPort, "test-token"));
+      clients.push(client);
+      try {
+        made.faux.setResponses([
+          testing.fauxAssistantMessage([testing.fauxToolCall("read", { path: "x" })], {
+            stopReason: "toolUse",
+          }),
+          testing.fauxAssistantMessage([testing.fauxText("gave up waiting")]),
+        ]);
+        const created = (await client.call(METHODS.SESSION_CREATE, {
+          cwd: timeoutWorkdir,
+          approvalMode: "ask",
+        })) as { sessionId: string };
+        await client.call(METHODS.SESSION_SEND, {
+          sessionId: created.sessionId,
+          text: "read something",
+        });
+
+        await nextApprovalRequest(client);
+        // No approval.respond: the 50 ms fuse fires and denies the call.
+        await waitFor(
+          () =>
+            client.notifications.some(
+              (n) => n.method === EVENTS.TOOL_RESULT && n.params?.isError === true,
+            ),
+          "error tool_result",
+        );
+        await waitForIdle(client);
+        const toolResult = client.notifications.find((n) => n.method === EVENTS.TOOL_RESULT);
+        expect(String(toolResult?.params?.output)).toContain("timed out");
+      } finally {
+        await shortFuse.stop();
+        await rm(timeoutDir, { recursive: true, force: true });
+      }
+    });
+
+    it("reports approvalMode in session.list", async () => {
+      const client = await openClient();
+      const askId = await createAskSession(client);
+      const auto = (await client.call(METHODS.SESSION_CREATE, { cwd: workdir })) as {
+        sessionId: string;
+      };
+
+      const listed = (await client.call(METHODS.SESSION_LIST, {})) as {
+        sessions: { id: string; approvalMode: string }[];
+      };
+      const byId = new Map(listed.sessions.map((s) => [s.id, s.approvalMode]));
+      expect(byId.get(askId)).toBe("ask");
+      expect(byId.get(auto.sessionId)).toBe("auto");
+    });
+
+    it(
+      "ignores responds from unattached connections and unknown approvalIds",
+      { timeout: 15000 },
+      async () => {
+        await writeFile(path.join(workdir, "hello.txt"), "hello from disk");
+        faux.setResponses([
+          testing.fauxAssistantMessage([testing.fauxToolCall("read", { path: "hello.txt" })], {
+            stopReason: "toolUse",
+          }),
+          testing.fauxAssistantMessage([testing.fauxText("read anyway")]),
+        ]);
+        const a = await openClient();
+        const b = await openClient(); // never attaches
+        const sessionId = await createAskSession(a);
+
+        await a.call(METHODS.SESSION_SEND, { sessionId, text: "read the file" });
+        const approval = await nextApprovalRequest(a);
+
+        // The request only went to attached connections.
+        expect(b.notifications.some((n) => n.method === EVENTS.APPROVAL_REQUEST)).toBe(false);
+
+        // A deny from an unattached connection must not resolve the approval.
+        b.notify(NOTIFICATIONS.APPROVAL_RESPOND, {
+          approvalId: approval?.params?.approvalId,
+          decision: "deny",
+        });
+        // Unknown approvalIds are dropped silently.
+        a.notify(NOTIFICATIONS.APPROVAL_RESPOND, {
+          approvalId: "appr_bogus",
+          decision: "deny",
+        });
+
+        // The real allow from the attached creator still lands.
+        a.notify(NOTIFICATIONS.APPROVAL_RESPOND, {
+          approvalId: approval?.params?.approvalId,
+          decision: "allow",
+        });
+
+        await waitForIdle(a);
+        const toolResults = a.notifications.filter((n) => n.method === EVENTS.TOOL_RESULT);
+        expect(toolResults).toHaveLength(1);
+        expect(toolResults[0]?.params).toMatchObject({ tool: "read", isError: false });
+      },
+    );
+
+    it("never asks for tools in autoApproveTools", { timeout: 15000 }, async () => {
+      await writeFile(path.join(workdir, "hello.txt"), "hello from disk");
+      faux.setResponses([
+        testing.fauxAssistantMessage([testing.fauxToolCall("read", { path: "hello.txt" })], {
+          stopReason: "toolUse",
+        }),
+        testing.fauxAssistantMessage([testing.fauxText("read without asking")]),
+      ]);
+      const client = await openClient();
+      const sessionId = await createAskSession(client, { autoApproveTools: ["read"] });
+
+      await client.call(METHODS.SESSION_SEND, { sessionId, text: "read the file" });
+      await waitForIdle(client);
+
+      expect(client.notifications.some((n) => n.method === EVENTS.APPROVAL_REQUEST)).toBe(false);
+      const toolResult = client.notifications.find((n) => n.method === EVENTS.TOOL_RESULT);
+      expect(toolResult?.params).toMatchObject({ tool: "read", isError: false });
+    });
+
+    it("denies immediately when no client is attached", { timeout: 15000 }, async () => {
+      let followUpMessages: unknown;
+      faux.setResponses([
+        testing.fauxAssistantMessage([testing.fauxToolCall("read", { path: "hello.txt" })], {
+          stopReason: "toolUse",
+        }),
+        (context) => {
+          followUpMessages = context.messages;
+          return testing.fauxAssistantMessage([testing.fauxText("no approver around")]);
+        },
+      ]);
+      const creator = await openClient();
+      const sessionId = await createAskSession(creator);
+      await creator.close();
+
+      const outsider = await openClient(); // connected, but not attached
+      await outsider.call(METHODS.SESSION_SEND, { sessionId, text: "read the file" });
+
+      // The tool call is denied without any approval_request on the wire; the
+      // follow-up LLM call carries the reason in its context.
+      await waitFor(() => faux.state.callCount >= 2, "follow-up llm call");
+      expect(JSON.stringify(followUpMessages)).toContain("no client attached to approve");
+      expect(outsider.notifications.some((n) => n.method === EVENTS.APPROVAL_REQUEST)).toBe(false);
+
+      await waitFor(async () => {
+        const listed = (await outsider.call(METHODS.SESSION_LIST, {})) as {
+          sessions: { id: string; state: string }[];
+        };
+        return listed.sessions.find((s) => s.id === sessionId)?.state === "idle";
+      }, "session back to idle");
+    });
   });
 });
