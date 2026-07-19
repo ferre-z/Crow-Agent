@@ -1,0 +1,29 @@
+{
+  "name": "@crow/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "crow": "./src/bin.ts"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@crow/client": "workspace:^",
+    "@crow/protocol": "workspace:^"
+  },
+  "devDependencies": {
+    "@crow/core": "workspace:^",
+    "@crow/daemon": "workspace:^",
+    "@types/node": "^22"
+  }
+}

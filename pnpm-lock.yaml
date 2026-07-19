@@ -33,6 +33,25 @@ importers:
         specifier: ^3
         version: 3.2.7(@types/node@22.20.1)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0)
 
+  apps/cli:
+    dependencies:
+      '@crow/client':
+        specifier: workspace:^
+        version: link:../../packages/client
+      '@crow/protocol':
+        specifier: workspace:^
+        version: link:../../packages/protocol
+    devDependencies:
+      '@crow/core':
+        specifier: workspace:^
+        version: link:../../packages/core
+      '@crow/daemon':
+        specifier: workspace:^
+        version: link:../../packages/daemon
+      '@types/node':
+        specifier: ^22
+        version: 22.20.1
+
   apps/desktop:
     dependencies:
       '@crow/client':
