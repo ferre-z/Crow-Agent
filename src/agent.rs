@@ -251,6 +251,34 @@ impl Agent {
 
     /// Append a user message and run the loop to completion.
     pub async fn submit(&mut self, user_msg: Message) -> Result<AgentEvent, AgentError> {
+        // Retry the run loop once on a transient empty-stream
+        // failure. Some upstream providers (notably NVIDIA's
+        // Nemotron 3 Ultra under load) occasionally return a stream
+        // with zero chunks before any error is emitted. A single
+        // retry clears it almost every time without surfacing the
+        // error to the user.
+        const MAX_EMPTY_STREAM_RETRIES: u32 = 1;
+        for attempt in 0..=MAX_EMPTY_STREAM_RETRIES {
+            let result = self.submit_once(&user_msg).await;
+            match result {
+                Ok(event) => return Ok(event),
+                Err(AgentError::Provider(msg))
+                    if attempt < MAX_EMPTY_STREAM_RETRIES && is_empty_stream_error(&msg) =>
+                {
+                    tracing::warn!("empty_stream on attempt {}; retrying after 1s", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        // Unreachable: the loop either returns Ok or the last Err.
+        unreachable!("retry loop must return or propagate")
+    }
+
+    /// One attempt at running a single user message through the
+    /// agent loop. Extracted from [`submit`] so the retry wrapper
+    /// can call it cleanly.
+    async fn submit_once(&mut self, user_msg: &Message) -> Result<AgentEvent, AgentError> {
         self.ensure_not_cancelled().await?;
         if self.config.session_writer.seq() == 0 {
             self.append(SessionEntry::SessionStarted {
@@ -267,14 +295,14 @@ impl Agent {
             session_id: self.session_id,
             started_at,
         });
-        let content = text_content(&user_msg);
+        let content = text_content(user_msg);
         self.append(SessionEntry::UserMessage {
             id: user_msg.id,
             content,
             timestamp: Timestamp::now(),
         })
         .await?;
-        self.history.push(user_msg);
+        self.history.push(user_msg.clone());
 
         let terminal = self.run_loop().await;
         // Always seal the writer on a terminal outcome so consumers
@@ -865,6 +893,16 @@ impl Agent {
         self.sink.on_event(AgentEvent::RunCancelled);
         Err(AgentError::Cancelled)
     }
+}
+
+/// True when the provider's error message looks like a transient
+/// empty-stream failure rather than a real problem with the
+/// request. We match a substring of the canonical error so the
+/// retry doesn't fire on unrelated `StreamInvalid` cases.
+fn is_empty_stream_error(msg: &str) -> bool {
+    msg.contains("empty_stream")
+        || msg.contains("empty stream")
+        || msg.contains("finish called before any Completed")
 }
 
 fn text_content(message: &Message) -> String {

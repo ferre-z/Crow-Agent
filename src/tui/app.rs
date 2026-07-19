@@ -677,8 +677,12 @@ impl App {
                 self.history.clear();
             }
             "help" => {
-                self.history
-                    .push(ChatEntry::StatusLine(SLASH_HELP.to_string()));
+                // Render each line of SLASH_HELP as its own
+                // StatusLine so the help block reads cleanly
+                // instead of as one giant wall of text.
+                for line in SLASH_HELP.lines() {
+                    self.history.push(ChatEntry::StatusLine(line.to_string()));
+                }
             }
             "doctor" => {
                 self.history.push(ChatEntry::StatusLine(format!(

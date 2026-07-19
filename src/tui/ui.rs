@@ -102,7 +102,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-/// Top header: model name, plan-mode badge, session path tail.
+/// Top header: short model name + plan-mode badge + short session
+/// id. Drops the full session path (still visible in the picker
+/// and `/status`) so the chrome fits on one line.
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(
@@ -114,7 +116,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("model: {}", app.model_label),
+            short_model_name(&app.model_label),
             apply(Style::default().fg(Color::Cyan), app.no_color),
         ),
     ];
@@ -135,7 +137,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
-        format!("session: {}", short_path(&app.session_path)),
+        format!("session {}", short_session_id(&app.session_id)),
         apply(Style::default().fg(Color::DarkGray), app.no_color),
     ));
     let title = Line::from(spans);
@@ -365,21 +367,20 @@ fn compute_scroll(total: usize, viewport: usize, scroll_back: usize) -> usize {
     max.saturating_sub(scroll_back).min(max)
 }
 
-/// Show only the tail of an absolute path so it fits the header.
-fn short_path(p: &std::path::Path) -> String {
-    let s = p.display().to_string();
-    let max = 48;
-    if s.len() <= max {
-        s
-    } else {
-        format!("…{}", &s[s.len() - (max - 1)..])
-    }
-}
-
 /// Show only the first 8 chars of a session id (ULIDs are 26 chars;
 /// 8 is plenty for collision-free identification in the status bar).
 fn short_session_id(id: &crate::ids::SessionId) -> String {
     id.0.to_string().chars().take(8).collect()
+}
+
+/// Show only the model family, dropping the vendor prefix.
+/// `nvidia/nemotron-3-ultra-550b-a55b` → `nemotron-3-ultra-550b-a55b`.
+/// Falls back to the full id when there's no `/`.
+fn short_model_name(model: &str) -> String {
+    match model.rsplit_once('/') {
+        Some((_, tail)) => tail.to_string(),
+        None => model.to_string(),
+    }
 }
 
 /// Render the session picker overlay as a centered modal.
