@@ -18,10 +18,14 @@ Crow is three things:
 
 ## Status
 
-Early scaffold. See `docs/` for the architecture and protocol spec. Build
-order follows the phase plan: P0 scaffold → P1 core+daemon MVP → P2 desktop
-MVP → P3 multihost fleet → P4 sub-agents/teams → P5 A2A → P6 workflows+cron →
-P7 memory → P8 distribution.
+Committed so far:
+
+- **P0** — monorepo scaffold, CI, docs
+- **P1** — `crowd` daemon + `@crow/core` runtime (sessions, confined tools, skills)
+- **P2** — `@crow/client` + Electron desktop hub + tool-call approvals
+- **P3** — in progress (multihost fleet + `crow` CLI, not committed yet)
+
+See `docs/` for the architecture and protocol spec.
 
 ## Repository layout
 
@@ -32,6 +36,7 @@ packages/
                                skills, MCP, sub-agents, teams
   memory/     @crow/memory   — SQLite memory: episodic log, facts, FTS5
   daemon/     @crow/daemon   — `crowd` per-host daemon
+  client/     @crow/client   — typed WS JSON-RPC client (used by desktop + CLI)
 apps/
   desktop/    Electron hub app (P2)
   cli/        `crow` thin client (P3)
@@ -40,16 +45,105 @@ docs/         architecture decisions, protocol spec
 scripts/      installer (P8)
 ```
 
-## Development
+## Local laptop setup
 
-Requires Node ≥ 20 and pnpm 9.
+Requires **Node ≥ 22.19** (pi packages require it) and **pnpm 9**.
 
 ```bash
+# 1. Clone
+gh repo clone ferre-z/Crow-Agent && cd Crow-Agent
+
+# 2. Install
 pnpm install
-pnpm check      # format:check + lint + typecheck + build + test
+
+# 3. Verify the gate (no API key needed; tests use a scripted fake provider)
+pnpm check   # format:check + lint + typecheck + build + test
 ```
 
-Per-package: `pnpm --filter @crow/<pkg> test|typecheck|build`.
+## Run the daemon
+
+The daemon stores its config/token in `~/.crow/daemon.json` (mode `600`).
+
+```bash
+# Start a local crowd on the default port (7749)
+pnpm --filter @crow/daemon start
+
+# Or explicitly:
+node packages/daemon/src/bin.ts --port 7749 --data-dir ~/.crow --token <your-token>
+```
+
+If you omit `--token`, one is generated for you. Read it from `~/.crow/daemon.json`
+to configure the desktop app / CLI.
+
+## Run the desktop app
+
+```bash
+# Make sure the Electron binary is downloaded first.
+# If `pnpm dev` complains about a missing binary:
+node apps/desktop/node_modules/electron/install.js
+
+pnpm --filter @crow/daemon start   # terminal 1
+pnpm --filter @crow/desktop dev    # terminal 2
+```
+
+Then in the desktop app add a host: `ws://127.0.0.1:7749` and the token from
+`~/.crow/daemon.json`.
+
+The app supports one host at a time in the committed P2 build; multihost fan-out
+is the current in-progress work (P3).
+
+## Run the CLI
+
+> Not wired up in the committed P2 build yet — `apps/cli/` is the current P3
+> workstream.
+
+When it lands, the workflow will be:
+
+```bash
+# Save a host
+crow hosts add local --url ws://127.0.0.1:7749 --token <token>
+
+# One-shot prompt
+crow prompt "list the files here" --host local
+
+# Or send to an existing session
+crow sessions --host local
+crow send <session-id> "what does package.json do?" --host local --wait
+```
+
+## Tests
+
+```bash
+pnpm test            # all workspace packages
+pnpm --filter @crow/core test
+pnpm --filter @crow/daemon test
+pnpm --filter @crow/desktop test
+pnpm --filter @crow/client test
+```
+
+No API key is needed for the test suite; it uses a scripted faux provider from
+`@crow/core/testing`.
+
+## Manual smoke test
+
+With a real daemon running:
+
+```bash
+# Daemon
+curl -i -N \
+  -H "Authorization: Bearer $(jq -r .token ~/.crow/daemon.json)" \
+  -H "Connection: Upgrade" \
+  -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \
+  -H "Sec-WebSocket-Version: 13" \
+  http://127.0.0.1:7749
+```
+
+Or use any WebSocket client and send NDJSON frames like:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"host.info","params":{}}\n
+```
 
 ## Conventions
 
@@ -58,3 +152,5 @@ Per-package: `pnpm --filter @crow/<pkg> test|typecheck|build`.
   never patches to upstream code.
 - Tests run against a scripted mock provider; no API key needed.
 - Conventional Commits (`feat(daemon): …`, `fix(core): …`).
+- Relative imports use `.ts` extensions; Node 22's built-in type stripping runs
+  sources directly in development (no build step needed for dev).
