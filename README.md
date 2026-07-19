@@ -1,8 +1,16 @@
 # Crow
 
-A small autonomous coding agent in Rust. Mirrors the workflow of Pi, Claude Code, Codex CLI, and OpenCode: receive a task, reason against a large language model, call tools, observe results, modify a repository, and continue until the task is answered.
+A small autonomous coding agent. Crow is built on top of
+[pi-coding-agent](https://github.com/earendil-works/pi) (the
+upstream agent loop, providers, session machinery, MCP,
+extensions, themes) and adds NVIDIA-first defaults, a custom
+theme, and a curated skill set on top.
 
-The first milestone is a reliable personal tool, not a platform. Keep the kernel small and extensible.
+Crow ships Claude-Code-style features — streaming TUI, tool cards
+with diffs, session branching, plan mode, compact, MCP, skills,
+themes, JSON mode, RPC mode — by riding pi. Crow's value-add is
+the conventions, defaults, and skills tuned for NVIDIA Nemotron 3
+Ultra.
 
 ---
 
@@ -14,188 +22,172 @@ The first milestone is a reliable personal tool, not a platform. Keep the kernel
 curl -sSf https://raw.githubusercontent.com/ferre-z/Crow-Agent/main/scripts/install.sh | sh
 ```
 
-**Test from a fresh clone (one line):**
+The installer auto-installs Node.js (>= 18), `git`, and `curl` via
+your system package manager when missing. Linux and macOS only
+(Windows: use WSL). Pass `--no-bootstrap` to opt out.
+
+After install, the `crow` binary is on PATH and ready:
 
 ```bash
-git clone https://github.com/ferre-z/Crow-Agent.git /tmp/crow && cd /tmp/crow && make test
+crow --version                          # confirm install
+crow tui                                # interactive Claude-Code-style REPL
+crow -p "say hi"                        # one-shot
+crow --mode json -p "list files in ."   # streaming JSON for CI
 ```
 
-**Try it:**
+Set your API key in the environment:
 
 ```bash
-crow --version
-crow doctor
+export NVIDIA_API_KEY="nvapi-..."        # default provider
+# or:  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, ...
 ```
 
-The installer **auto-installs missing dependencies** (Rust via rustup, `git` / `make` / `curl` via your package manager) so it works on a clean box. Linux and macOS only (Windows blocked by the `nix` crate). Pass `--no-bootstrap` to opt out.
-
-Default install uses the **debug** profile so it fits on disk-quota boxes (no `quota exceeded` errors). For an optimised binary, pass `--release`.
+Crow boots straight into Nemotron 3 Ultra on the `crow/dark` theme
+when `NVIDIA_API_KEY` is set; pick any other model via `/model`
+or `--model`.
 
 ### All commands at a glance
 
 | Goal | Command |
 |---|---|
 | Install | `curl -sSf https://raw.githubusercontent.com/ferre-z/Crow-Agent/main/scripts/install.sh \| sh` |
-| Test | `git clone https://github.com/ferre-z/Crow-Agent.git /tmp/crow && cd /tmp/crow && make test` |
-| Build release | `cargo build --release` (or `make build`) |
-| Install release | `curl -sSf .../install.sh \| sh -s -- --release` |
-| Verify config | `crow doctor` |
-| Build the kernel + run all tests | `make ci` |
-| See every Makefile target | `make help` |
-| Launch the TUI | `crow tui` |
-| Resume a past session | `crow tui --resume <id>` |
-| Plan mode (read-only) | `crow tui --plan` |
+| Install release build | `… \| sh -s -- --release` |
+| Run tests | `git clone … && cd pi-crow && npm run check` |
+| Launch interactive TUI | `crow tui` |
+| Resume a past session | `crow -c` (or `crow tui -c`) |
+| Pick from session list | `crow -r` |
+| Pick a different model | `crow --model <id>` |
+| One-shot prompt | `crow -p "fix the bug"` |
+| Streaming JSON | `crow --mode json -p "..."` |
+| RPC mode (for tooling) | `crow --mode rpc` |
+| List slash commands | `/help` (inside the TUI) |
+| Install a Crow extension | `crow install npm:@crow/<pkg>` |
 
-## Interactive terminal UI
+---
 
-`crow tui` runs an interactive streaming REPL against the same
-kernel the headless `crow exec` uses. The visual surface matches
-Claude Code's `tui`:
+## What's different from upstream pi
 
-- Streaming assistant text with **markdown** (bold, italic,
-  inline code, fenced code, lists) via `pulldown-cmark`
-- **Tool cards** with diffs:
-  - `read` — line-numbered file preview
-  - `write` — file body preview
-  - `edit` — unified red/green diff via `similar`
-  - `bash` — command + stdout/stderr + status
-- **Session picker** overlay (`/resume`): arrow keys / PageUp-Down
-  to navigate, Enter to select, Esc to cancel
-- **Approval overlay** for policy-driven asks (`y` allow,
-  `a` allow for the rest of the session, `n` deny)
-- **Plan mode** (`--plan` or `/plan`): only `read` is available;
-  the agent can inspect code but cannot mutate
-- **Inline error banners** on `RunFailed` so failures are visible
-  after scrolling, not just in the status bar
-- **`--no-color`** for screen readers, dumb terminals, CI logs
-- **`/help` `/clear` `/doctor` `/model` `/quit`** slash commands
-- `PageUp` / `PageDown` / `End` to scroll the chat; tail-anchored
-  by default
-- `Esc` / `Ctrl+C` interrupt a run; `Ctrl+D` on empty input quits
+| Surface | pi (default) | Crow |
+|---|---|---|
+| Default provider | anthropic | **nvidia** |
+| Default model | claude-opus-4-8 | **nvidia/nemotron-3-ultra-550b-a55b** |
+| Default theme | dark | **crow/dark** (greener Crow palette) |
+| Branded commands | `/help`, `/login`, `/model`, … | adds `/crow-status`, `/crow-review`, `/crow-plan`, `/crow-onboard`, `/crow-test`, `/crow-commit` |
+| Footer | built-in | optional **crow-status** extension (tokens + cost + ctx % + model + branch) |
+| Pricing table | none | bundled per-model rates for the defaults |
 
-The TUI shares session storage with the headless CLI: each TUI run
-writes a JSONL log under `<project>/.crow/sessions/` that `crow
-sessions` lists and `crow tui --resume <id>` reuses.
+Everything else (Anthropic/OpenAI/Google/Bedrock providers,
+plan-mode-as-file, compact, MCP, session branching, RPC mode,
+JSON mode, keybindings, theme hot-reload) ships unchanged from
+upstream pi.
 
-The Tauri 2 desktop app in `apps/desktop/` is still available
-for users who want a native window; it drives the same kernel
-through `crow serve`.
+---
+
+## Architecture
+
+```
+crow-agent/
+├── pi-crow/                      fork of pi-mono, rebranded to @crow/*
+│   ├── packages/
+│   │   ├── ai/                   unified provider layer (NVIDIA, Anthropic, …)
+│   │   ├── agent/                agent-core
+│   │   ├── tui/                  pi-tui (differential TUI rendering)
+│   │   ├── orchestrator/
+│   │   └── coding-agent/         'crow' binary (rebranded from 'pi')
+│   └── extensions/crow/
+│       ├── extensions/crow-status-line.ts
+│       ├── skills/
+│       │   ├── crow-review/
+│       │   ├── crow-plan/
+│       │   ├── crow-onboard/
+│       │   ├── crow-test/
+│       │   └── crow-commit/
+│       ├── themes/crow-dark.json
+│       └── package.json          declares skills + themes + extensions
+├── apps/desktop/                 Tauri 2 shell (Rust)
+│   ├── crow-desktop-bridge.js    Node bridge: JSON-RPC ↔ pi --mode rpc
+│   ├── src/                      React + TypeScript frontend
+│   └── src-tauri/                Tauri Rust shell
+├── config/
+│   └── pricing.toml              per-model token rates (legacy, kept for parity)
+├── docs/
+│   ├── PI_PIVOT_PLAN.md          the pivot plan this repo followed
+│   ├── TUI_PARITY_PLAN.md        the original from-scratch TUI plan
+│   └── (postmortems, briefs, decisions)
+└── scripts/install.sh            the one-line installer
+```
+
+The Rust kernel that previously implemented the agent loop lives
+in git history but is no longer the source of truth. See
+`archive/crow-rust-v0/` (preserved in git) for the old code.
+
+---
+
+## Skills (ship with Crow)
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `/crow-review` | "review my changes / this file" | Structured diff review with severity tags (Critical / Major / Minor / Nit) |
+| `/crow-plan` | "plan X first" | Read-only plan mode; writes `.crow/plans/<id>.md` and waits for approval |
+| `/crow-onboard` | first run / "set up this project" | Detects stack, drafts `AGENTS.md`, configures providers |
+| `/crow-test` | "run the tests" | Smart test runner per stack, skips integration by default |
+| `/crow-commit` | "commit this" | Conventional-Commit generator from staged diff; never pushes |
+
+Each is a single `SKILL.md` under `pi-crow/extensions/crow/skills/`
+following the Agent Skills standard. They ship inside the
+`@crow/coding-agent` npm package and install via
+`crow install npm:@crow/coding-agent`.
+
+---
+
+## Themes
+
+- `crow/dark` — Crow's default. Greener accent palette, slightly
+  warmer text. Drop-in if you want the upstream `dark` instead:
+  `/settings → theme → dark`.
+
+Themes hot-reload: edit a theme file in
+`pi-crow/extensions/crow/themes/` and Crow applies the change
+immediately.
+
+---
+
+## Desktop
+
+`apps/desktop/` is a Tauri 2 shell that drives Crow via
+`apps/desktop/crow-desktop-bridge.js` — a ~150-LOC Node bridge
+that translates the desktop's existing JSON-RPC contract into
+pi's `--mode rpc` wire format. Run `npm run tauri dev` in
+`apps/desktop/` to launch.
+
+---
+
+## Pricing
+
+`config/pricing.toml` ships per-model USD/1K rates and context
+sizes for the defaults. The `crow-status` extension reads this
+table to render the footer line.
+
+| Model | Input $/1K | Output $/1K | Context |
+|---|---|---|---|
+| `nvidia/nemotron-3-ultra-550b-a55b` | 0.0005 | 0.0015 | 262 144 |
+| `nvidia/llama-3.1-nemotron-ultra-253b-v1` | 0.0006 | 0.0006 | 131 072 |
+| `meta/llama-3.1-70b-instruct` | 0.00059 | 0.00079 | 131 072 |
 
 ---
 
 ## Status
 
-**v0 in active development.** Shipped so far:
+**v0 — pivoted to pi-coding-agent.**
 
-- Cargo binary crate, Rust toolchain pinned via `rust-toolchain.toml`
-- CI on GitHub Actions (`cargo fmt`, `clippy -D warnings`, `cargo test`)
-- Provider-neutral event accumulator and message types (`src/event.rs`, `src/message.rs`)
-- `genai = 0.6.5` provider adapter against NVIDIA Nemotron 3 Ultra (`src/provider/genai.rs`)
-- Project-root-confined tool registry with `read`, `write`, `edit`, `bash` shipped (`src/tool/`)
-- Agent state machine + tool-call loop with stop-reason handling, event sink, and durable `RunFailed` records (`src/agent.rs`)
-- Hierarchical `AGENTS.md` discovery + context compiler (`src/context.rs`)
-- Layered config (CLI > env > user file > defaults) + clap CLI with `exec`, `sessions`, `resume`, `doctor`, `serve`, `mcp-opencode`, `tui` subcommands (`src/cli.rs`, `src/config.rs`)
-- Session recovery: trailing-sequence recovery, stale-lock eviction, crash-tail detection (`src/session.rs`)
-- `Agent::resume_into` for `crow --resume <id>` (`src/agent.rs`)
-- Interactive terminal UI: `crow tui` (`src/tui/`). Streaming REPL against the kernel, per-tool rich rendering with diffs, session picker, approval overlay with session-scoped "always allow", plan mode (`--plan`), markdown rendering in chat, `--no-color` for axe readers, inline error banners.
-- App-server (`crow serve`) JSON-RPC over stdio for the desktop shell and external CLIs.
-- Tauri 2 desktop shell (`apps/desktop/`) backed by `crow serve` as a sidecar.
+The original Crow repo (Rust kernel + TUI + session storage) is
+archived in git at the previous `main` tip. See
+`docs/PI_PIVOT_PLAN.md` for the rationale and the migration
+checklist.
 
-In progress: OS keyring, mcp-opencode server hardening.
-
-## Stack
-
-| Concern | Choice |
-|---|---|
-| Async runtime | `tokio` + `tokio-util` |
-| Model client | `genai = 0.6.5` (OpenAI-compatible NVIDIA endpoint) |
-| Serialization | `serde`, `serde_json`, `schemars`, `toml` |
-| CLI | `clap` |
-| Errors | `thiserror`, `anyhow` |
-| Diagnostics | `tracing`, `tracing-subscriber` |
-| IDs | `ulid` |
-| Secrets | `secrecy` |
-| Tests | `tempfile`, `filetime`, scripted mock provider |
-
-## Architecture
-
-One binary crate. Module boundaries (from `src/`):
-
-```
-cli.rs        # clap entry + subcommands (exec, sessions, resume, doctor, tui, serve, mcp-opencode)
-config.rs     # layered config (CLI > env > user > defaults)
-ids.rs        # session, run, message, tool-call IDs (ULID)
-message.rs    # provider-neutral conversation data
-event.rs      # AgentEvent + SessionEntry + AgentEventSink
-provider/
-  mod.rs      # Provider trait
-  stream.rs   # StreamAccumulator + ProviderChunk
-  mock.rs     # ScriptedProvider for tests
-  genai.rs    # genai 0.6.5 adapter (NVIDIA endpoint)
-agent.rs      # state machine, tool-call loop, limits, cancellation, resume
-context.rs    # system prompt + AGENTS.md discovery
-session.rs    # JSONL writer/reader, recovery, stale-lock detection
-policy.rs     # ApprovalPolicy + AskResolver (drives the TUI approval overlay)
-tool/
-  mod.rs      # Tool trait, registry, ToolSpec, limits
-  path.rs     # project-root path resolution
-  read.rs     # line-numbered read (sniff-then-read, bounded)
-  write.rs    # atomic temp+rename
-  edit.rs     # exact-match replacement with diff summary
-  bash.rs     # shell exec with process-group kill on timeout
-tui/          # interactive terminal UI (crow tui)
-  mod.rs      # driver: terminal setup, worker task, channels, main loop
-  app.rs      # App model + AgentEvent reducer + keymap
-  ui.rs       # layout, chat scrollback, header/status, picker, approval card
-  commands.rs # slash-command parser (/help, /clear, /resume, /plan, /quit, ...)
-  tools.rs    # per-tool rich rendering (read, write, edit, bash, generic)
-  picker.rs   # session picker state machine
-  approval.rs # approval overlay state + session allowlist
-  markdown.rs # pulldown-cmark -> ratatui Line
-app_server.rs # crow serve JSON-RPC over stdio
-mcp_opencode.rs # crow mcp-opencode (MCP server that delegates to opencode)
-tests/        # integration + gate tests
-```
-
-The desktop app (Tauri 2) is a separate crate that talks to the same kernel via the future `crow serve` JSON-RPC service.
-
-## Building
-
-```bash
-make test     # offline test suite, no API key needed
-make build    # release build (target/release/crow)
-make lint     # clippy with -D warnings
-make ci       # fmt + lint + build + test (matches GitHub Actions)
-```
-
-Raw cargo equivalents work too — the Makefile just wraps them:
-
-```bash
-cargo build --release
-cargo test --all-targets --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-Requires the Rust toolchain pinned in `rust-toolchain.toml` (1.88). rustup picks it up automatically on `cd`.
-
-## Running
-
-```bash
-make run -- --version           # forwards args to cargo run
-make run -- doctor              # validate config
-make run -- sessions            # list sessions
-make run -- exec "..."          # one-shot task
-make run -- resume <id> "..."   # resume a session
-```
-
-Or directly via the installed binary: `crow --version`, `crow doctor`, etc.
-
-Live Nemotron requires `NVIDIA_API_KEY` (or `CROW_API_KEY`) in the environment. The repository ships with a scripted mock provider so deterministic tests run without network access.
-
-## Trust model
-
-Crow is autonomous. There is no permission engine or confirmation prompt. Run it only in environments where user-level command execution is acceptable. Cancellation, command timeouts, bounded output, atomic file replacement, log redaction, and project-root confinement are still enforced.
-
-## Spec
-
-The full design specification lives in the `ferre-z/ob-vault` repo at `30 Projects/Agent & ecosystem/08-Personal-Agent-v0-Spec.md`. It is the source of truth for behavior, dependencies, message/event schemas, failure handling, tests, and acceptance criteria.
+What's coming:
+- Crow extensions package on npm (`@crow/coding-agent`)
+- `/memory` and `/init` skills
+- Lighter crow-desktop-bridge that uses pi's native RPC protocol
+  instead of the desktop's bespoke one
+- A web UI (Tauri doesn't fit every workflow)
