@@ -21,6 +21,9 @@
     ],
     "themes": [
       "./themes"
+    ],
+    "extensions": [
+      "./extensions/crow-status-line.ts"
     ]
   }
 }
