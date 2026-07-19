@@ -1,5 +1,0 @@
-{"type":"ModelStarted"}
-{"type":"TextDelta","text":"Hello"}
-{"type":"TextDelta","text":" world"}
-{"type":"ModelFinished","usage":{"input_tokens":5,"output_tokens":2},"stop_reason":"EndTurn"}
-{"type":"RunFinished","message":"done"}

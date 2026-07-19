@@ -1,7 +1,0 @@
-node_modules/
-dist/
-.env
-.env.local
-*.tsbuildinfo
-src-tauri/target/
-src-tauri/binaries/
