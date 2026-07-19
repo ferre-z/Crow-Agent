@@ -1,14 +1,17 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import type { ScreenProps } from "./App.tsx";
 import ApprovalModal from "./ApprovalModal.tsx";
 import ChatView from "./ChatView.tsx";
 import {
+  makeSessionKey,
   selectActiveSession,
+  selectConnectedHosts,
   selectCurrentApproval,
   selectSessions,
   sessionDisplayName,
   type LiveSessionState,
+  type SessionEntry,
 } from "./state.ts";
 
 const DOT_CLASS: Record<LiveSessionState, string> = {
@@ -18,33 +21,68 @@ const DOT_CLASS: Record<LiveSessionState, string> = {
   cancelled: "bg-warn",
 };
 
-export default function MainScreen({ state, dispatch }: ScreenProps) {
-  const [cwd, setCwd] = useState("~");
-  const [approvalMode, setApprovalMode] = useState<"auto" | "ask">("ask");
-  const [autoApproveTools, setAutoApproveTools] = useState("");
+function SessionRow({
+  session,
+  active,
+  onSelect,
+}: {
+  session: SessionEntry;
+  active: boolean;
+  onSelect: (hostName: string, sessionId: string) => void;
+}) {
+  return (
+    <button
+      onClick={() => onSelect(session.hostName, session.info.id)}
+      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-ink-2 ${
+        active ? "bg-ink-2 text-crow" : ""
+      }`}
+    >
+      <span
+        className={`h-2 w-2 shrink-0 rounded-full ${DOT_CLASS[session.live]}`}
+        title={session.live}
+      />
+      <span className="min-w-0 flex-1 truncate">{sessionDisplayName(session)}</span>
+      <span className="shrink-0 text-[10px] text-fg-dim">{session.live}</span>
+    </button>
+  );
+}
 
+export default function MainScreen({ state, dispatch }: ScreenProps) {
+  const connectedHosts = selectConnectedHosts(state).filter((h) => h.state === "connected");
   const sessions = selectSessions(state);
   const active = selectActiveSession(state);
   const currentApproval = selectCurrentApproval(state);
 
-  async function handleDisconnect() {
-    await window.crow.hostDisconnect().catch(() => undefined);
-    dispatch({ type: "disconnect.requested" });
-  }
+  const [cwd, setCwd] = useState("~");
+  const [approvalMode, setApprovalMode] = useState<"auto" | "ask">("ask");
+  const [autoApproveTools, setAutoApproveTools] = useState("");
+  const [selectedHost, setSelectedHost] = useState<string>(connectedHosts[0]?.host.name ?? "");
+
+  // Keep the selected host valid if the fleet changes.
+  const hostOptions = useMemo(() => connectedHosts.map((h) => h.host.name), [connectedHosts]);
+  const canCreate = hostOptions.length > 0;
+  useEffect(() => {
+    if (!hostOptions.includes(selectedHost)) {
+      setSelectedHost(hostOptions[0] ?? "");
+    }
+  }, [hostOptions, selectedHost]);
 
   async function handleCreate() {
+    if (!selectedHost) return;
     const target = cwd.trim() || "~";
     const tools = autoApproveTools
       .split(",")
       .map((t) => t.trim())
       .filter(Boolean);
     const { sessionId } = await window.crow.sessionCreate({
+      hostName: selectedHost,
       cwd: target,
       approvalMode,
       ...(tools.length > 0 ? { autoApproveTools: tools } : {}),
     });
     dispatch({
       type: "session.created",
+      hostName: selectedHost,
       info: {
         id: sessionId,
         cwd: target,
@@ -56,51 +94,51 @@ export default function MainScreen({ state, dispatch }: ScreenProps) {
     });
   }
 
-  function handleSelect(sessionId: string) {
-    dispatch({ type: "session.selected", sessionId });
-    // Attach is idempotent; the creator is auto-attached, others join live.
-    void window.crow.sessionAttach(sessionId).catch(() => undefined);
+  function handleSelect(hostName: string, sessionId: string) {
+    dispatch({ type: "session.selected", hostName, sessionId });
+    void window.crow.sessionAttach({ hostName, sessionId }).catch(() => undefined);
   }
+
+  const sessionsByHost = useMemo(() => {
+    const map = new Map<string, SessionEntry[]>();
+    for (const host of connectedHosts) {
+      map.set(host.host.name, []);
+    }
+    for (const session of sessions) {
+      const list = map.get(session.hostName);
+      if (list) list.push(session);
+    }
+    return map;
+  }, [connectedHosts, sessions]);
 
   return (
     <div className="flex h-full bg-ink">
-      <aside className="flex w-72 shrink-0 flex-col border-r border-line bg-ink-1">
+      <aside className="flex w-80 shrink-0 flex-col border-r border-line bg-ink-1">
         <div className="border-b border-line p-3">
           <div className="flex items-center justify-between">
             <span className="text-sm font-semibold text-crow">crow</span>
-            <button
-              onClick={() => void handleDisconnect()}
-              className="rounded border border-line px-2 py-0.5 text-xs text-fg-dim hover:text-danger"
-            >
-              disconnect
-            </button>
+            <span className="text-xs text-fg-dim">{connectedHosts.length} host(s) connected</span>
           </div>
-          {state.hostInfo ? (
-            <dl className="mt-2 space-y-0.5 text-xs text-fg-dim">
-              <div className="flex justify-between">
-                <dt>host</dt>
-                <dd className="font-mono text-fg">{state.hostInfo.hostname}</dd>
-              </div>
-              <div className="flex justify-between">
-                <dt>platform</dt>
-                <dd className="font-mono">
-                  {state.hostInfo.platform}/{state.hostInfo.arch}
-                </dd>
-              </div>
-              <div className="flex justify-between">
-                <dt>daemon</dt>
-                <dd className="font-mono">
-                  v{state.hostInfo.daemonVersion} · proto {state.hostInfo.protocolVersion}
-                </dd>
-              </div>
-            </dl>
-          ) : null}
         </div>
 
         <div className="border-b border-line p-3">
           <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-fg-dim">
             new session
           </div>
+          <select
+            value={selectedHost}
+            onChange={(e) => setSelectedHost(e.target.value)}
+            disabled={!canCreate}
+            className="mb-1.5 w-full rounded border border-line bg-ink px-2 py-1 text-xs outline-none focus:border-crow disabled:opacity-50"
+            title="host"
+          >
+            {hostOptions.length === 0 ? <option value="">no connected hosts</option> : null}
+            {hostOptions.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
           <input
             value={cwd}
             onChange={(e) => setCwd(e.target.value)}
@@ -126,35 +164,52 @@ export default function MainScreen({ state, dispatch }: ScreenProps) {
           </div>
           <button
             onClick={() => void handleCreate()}
-            className="w-full rounded bg-crow px-2 py-1 text-xs font-semibold text-ink hover:bg-crow-dim"
+            disabled={!canCreate}
+            className="w-full rounded bg-crow px-2 py-1 text-xs font-semibold text-ink hover:bg-crow-dim disabled:opacity-50"
           >
             + new session
           </button>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-2">
-          {sessions.length === 0 ? (
-            <p className="px-1 py-2 text-xs text-fg-dim">No sessions on this host yet.</p>
+          {connectedHosts.length === 0 ? (
+            <p className="px-1 py-2 text-xs text-fg-dim">No hosts connected.</p>
           ) : (
-            <ul className="space-y-0.5">
-              {sessions.map((session) => (
-                <li key={session.info.id}>
-                  <button
-                    onClick={() => handleSelect(session.info.id)}
-                    className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-ink-2 ${
-                      active?.info.id === session.info.id ? "bg-ink-2 text-crow" : ""
-                    }`}
-                  >
-                    <span
-                      className={`h-2 w-2 shrink-0 rounded-full ${DOT_CLASS[session.live]}`}
-                      title={session.live}
-                    />
-                    <span className="min-w-0 flex-1 truncate">{sessionDisplayName(session)}</span>
-                    <span className="shrink-0 text-[10px] text-fg-dim">{session.live}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
+            <div className="space-y-3">
+              {connectedHosts.map((host) => {
+                const hostSessions = sessionsByHost.get(host.host.name) ?? [];
+                return (
+                  <div key={host.host.name}>
+                    <div className="mb-1 flex items-center gap-2 px-1 text-xs font-semibold text-fg-dim">
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          host.state === "connected" ? "bg-crow" : "bg-fg-dim/40"
+                        }`}
+                      />
+                      {host.host.name}
+                    </div>
+                    {hostSessions.length === 0 ? (
+                      <p className="px-1 py-1 text-xs text-fg-dim">No sessions on this host yet.</p>
+                    ) : (
+                      <ul className="space-y-0.5">
+                        {hostSessions.map((session) => (
+                          <li key={makeSessionKey(session.hostName, session.info.id)}>
+                            <SessionRow
+                              session={session}
+                              active={
+                                makeSessionKey(session.hostName, session.info.id) ===
+                                state.activeSessionKey
+                              }
+                              onSelect={handleSelect}
+                            />
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       </aside>

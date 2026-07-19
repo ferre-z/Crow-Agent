@@ -88,6 +88,7 @@ export default function ChatView({
 }) {
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const hostName = session.hostName;
   const sessionId = session.info.id;
   const streaming = session.live === "streaming";
 
@@ -99,13 +100,13 @@ export default function ChatView({
   function send() {
     const text = input.trim();
     if (!text || streaming) return;
-    dispatch({ type: "prompt.sent", sessionId, text });
-    void window.crow.sessionSend({ sessionId, text }).catch(() => undefined);
+    dispatch({ type: "prompt.sent", hostName, sessionId, text });
+    void window.crow.sessionSend({ hostName, sessionId, text }).catch(() => undefined);
     setInput("");
   }
 
   function cancel() {
-    void window.crow.sessionCancel(sessionId).catch(() => undefined);
+    void window.crow.sessionCancel({ hostName, sessionId }).catch(() => undefined);
   }
 
   return (

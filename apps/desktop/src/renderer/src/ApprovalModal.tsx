@@ -34,7 +34,11 @@ export default function ApprovalModal({
 }) {
   function respond(decision: ApprovalDecision) {
     void window.crow
-      .approvalRespond({ approvalId: approval.approvalId, decision })
+      .approvalRespond({
+        hostName: approval.hostName,
+        approvalId: approval.approvalId,
+        decision,
+      })
       .catch(() => undefined);
     dispatch({ type: "approval.responded", approvalId: approval.approvalId, decision });
   }
@@ -44,7 +48,11 @@ export default function ApprovalModal({
       <div className="w-[520px] max-w-full rounded-lg border border-warn/50 bg-ink-1 p-5 shadow-2xl">
         <h2 className="text-sm font-semibold text-warn">tool approval requested</h2>
         <p className="mt-1 text-xs text-fg-dim">
-          The agent wants to run <span className="font-mono text-fg">{approval.tool}</span>
+          The agent on <span className="font-semibold text-fg">{approval.hostName}</span> wants to
+          run <span className="font-mono text-fg">{approval.tool}</span>
+        </p>
+        <p className="mt-0.5 text-[10px] text-fg-dim">
+          session <span className="font-mono">{approval.sessionId}</span>
         </p>
         <pre className="mt-3 max-h-64 overflow-auto rounded border border-line bg-ink p-2 font-mono text-xs text-fg-dim">
           {pretty(approval.args)}

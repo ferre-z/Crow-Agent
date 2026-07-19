@@ -4,14 +4,16 @@ import type {
   ApprovalDecision,
   DaemonConnectionState,
   DaemonEventFrame,
+  HostConnectionView,
   HostInfoResult,
   KnownHost,
 } from "../../shared/api.ts";
 
 /**
  * Renderer store: a single pure reducer fed by daemon events and UI actions.
- * No react imports here — App.tsx wires it with useReducer. Everything the UI
- * renders is derived from AppState via the select* helpers at the bottom.
+ * P3: multihost. Sessions are keyed by `${hostName}:${sessionId}` so the same
+ * id on two hosts stays distinct. The fleet slice tracks each saved host's
+ * connection state and host.info.
  */
 
 export type LiveSessionState = "idle" | "streaming" | "error" | "cancelled";
@@ -62,66 +64,74 @@ export type TranscriptItem =
   | TranscriptApprovalItem;
 
 export interface SessionEntry {
+  hostName: string;
   info: SessionInfo;
-  /** Live state from event.session_state; richer than SessionInfo's coarse idle/busy. */
   live: LiveSessionState;
   error?: string;
   transcript: TranscriptItem[];
-  /** Per-session item id counter — keeps the reducer pure (no Date.now/Math.random). */
   nextItemSeq: number;
 }
 
 export interface PendingApproval {
-  approvalId: string;
+  hostName: string;
   sessionId: string;
+  approvalId: string;
   callId: string;
   tool: string;
   args: unknown;
 }
 
+export interface FleetHostEntry {
+  host: KnownHost;
+  state: DaemonConnectionState;
+  info?: HostInfoResult;
+  error?: string;
+  connecting?: boolean;
+}
+
 export interface AppState {
-  connection: DaemonConnectionState;
-  connecting: boolean;
   hosts: KnownHost[];
-  /** Inline error on the connect screen (connect failure or lost connection). */
-  connectError?: string;
-  hostName?: string;
-  hostInfo?: HostInfoResult;
+  fleet: Record<string, FleetHostEntry>;
   sessions: Record<string, SessionEntry>;
   sessionOrder: string[];
-  activeSessionId?: string;
-  /** FIFO queue; the modal shows the head. */
+  activeSessionKey?: string;
   pendingApprovals: PendingApproval[];
 }
 
 export type Action =
   | { type: "hosts.set"; hosts: KnownHost[] }
-  | { type: "connect.started" }
-  | {
-      type: "connect.succeeded";
-      hostName: string;
-      info: HostInfoResult;
-      sessions: SessionInfo[];
-    }
-  | { type: "connect.failed"; message: string }
-  | { type: "disconnect.requested" }
-  | { type: "daemon.connection"; state: DaemonConnectionState }
-  | { type: "sessions.set"; sessions: SessionInfo[] }
-  | { type: "session.created"; info: SessionInfo }
-  | { type: "session.selected"; sessionId: string }
-  | { type: "prompt.sent"; sessionId: string; text: string }
+  | { type: "fleet.set"; views: HostConnectionView[] }
+  | { type: "fleet.update"; hostName: string; patch: Partial<FleetHostEntry> }
+  | { type: "connect.started"; hostName: string }
+  | { type: "connect.succeeded"; hostName: string; info: HostInfoResult }
+  | { type: "connect.failed"; hostName: string; message: string }
+  | { type: "host.disconnect"; hostName: string }
+  | { type: "host.remove"; hostName: string }
+  | { type: "sessions.set"; hostName: string; sessions: SessionInfo[] }
+  | { type: "session.created"; hostName: string; info: SessionInfo }
+  | { type: "session.selected"; hostName: string; sessionId: string }
+  | { type: "prompt.sent"; hostName: string; sessionId: string; text: string }
   | { type: "daemon.event"; frame: DaemonEventFrame }
   | { type: "approval.responded"; approvalId: string; decision: ApprovalDecision };
 
 export function initialState(): AppState {
   return {
-    connection: "disconnected",
-    connecting: false,
     hosts: [],
+    fleet: {},
     sessions: {},
     sessionOrder: [],
     pendingApprovals: [],
   };
+}
+
+export function makeSessionKey(hostName: string, sessionId: string): string {
+  return `${hostName}:${sessionId}`;
+}
+
+export function parseSessionKey(key: string): { hostName: string; sessionId: string } {
+  const idx = key.indexOf(":");
+  if (idx === -1) return { hostName: "", sessionId: key };
+  return { hostName: key.slice(0, idx), sessionId: key.slice(idx + 1) };
 }
 
 export function reducer(state: AppState, action: Action): AppState {
@@ -129,61 +139,69 @@ export function reducer(state: AppState, action: Action): AppState {
     case "hosts.set":
       return { ...state, hosts: action.hosts };
 
-    case "connect.started":
-      return { ...state, connecting: true, connectError: undefined };
-
-    case "connect.succeeded": {
-      const sessions: Record<string, SessionEntry> = {};
-      const sessionOrder: string[] = [];
-      for (const info of action.sessions) {
-        sessions[info.id] = {
-          info,
-          live: coarseToLive(info.state),
-          transcript: [],
-          nextItemSeq: 1,
+    case "fleet.set": {
+      const fleet: Record<string, FleetHostEntry> = {};
+      for (const view of action.views) {
+        fleet[view.host.name] = {
+          host: view.host,
+          state: view.state,
+          info: view.info,
         };
-        sessionOrder.push(info.id);
       }
+      return { ...state, fleet };
+    }
+
+    case "fleet.update": {
+      const existing = state.fleet[action.hostName];
+      if (!existing) return state;
       return {
         ...state,
-        connection: "connected",
-        connecting: false,
-        connectError: undefined,
-        hostName: action.hostName,
-        hostInfo: action.info,
-        sessions,
-        sessionOrder,
-        activeSessionId: undefined,
-        pendingApprovals: [],
+        fleet: {
+          ...state.fleet,
+          [action.hostName]: { ...existing, ...action.patch },
+        },
       };
     }
 
+    case "connect.started":
+      return setFleetHost(state, action.hostName, {
+        state: "disconnected",
+        connecting: true,
+        error: undefined,
+      });
+
+    case "connect.succeeded":
+      return setFleetHost(state, action.hostName, {
+        state: "connected",
+        connecting: false,
+        info: action.info,
+        error: undefined,
+      });
+
     case "connect.failed":
-      return { ...state, connecting: false, connectError: action.message };
+      return setFleetHost(state, action.hostName, {
+        state: "disconnected",
+        connecting: false,
+        error: action.message,
+      });
 
-    case "disconnect.requested":
-      return {
-        ...initialState(),
-        hosts: state.hosts,
-      };
+    case "host.disconnect":
+      return dropHostSessions(setFleetHost(state, action.hostName, { state: "disconnected" }), [
+        action.hostName,
+      ]);
 
-    case "daemon.connection": {
-      if (action.state === "connected") return state; // connect.succeeded drives that transition
-      if (state.connection !== "connected") return state; // already on the connect screen
-      return {
-        ...initialState(),
-        hosts: state.hosts,
-        connectError: `lost connection to ${state.hostName ?? "the daemon"}`,
-      };
+    case "host.remove": {
+      const fleet = { ...state.fleet };
+      delete fleet[action.hostName];
+      return dropHostSessions({ ...state, fleet }, [action.hostName]);
     }
 
     case "sessions.set": {
       let next = state;
       for (const info of action.sessions) {
-        next = updateSession(next, info.id, (entry) =>
-          // Listed sessions we already track keep their live event state; the
-          // coarse list only fills in fresh entries and refreshes info fields.
-          state.sessions[info.id]
+        const key = makeSessionKey(action.hostName, info.id);
+        next = updateSession(next, key, (entry) =>
+          next.sessions[key]
             ? { ...entry, info }
             : { ...entry, info, live: coarseToLive(info.state) },
         );
@@ -192,24 +210,30 @@ export function reducer(state: AppState, action: Action): AppState {
     }
 
     case "session.created": {
-      const next = updateSession(state, action.info.id, (entry) => ({
+      const key = makeSessionKey(action.hostName, action.info.id);
+      const next = updateSession(state, key, (entry) => ({
         ...entry,
+        hostName: action.hostName,
         info: action.info,
         live: coarseToLive(action.info.state),
       }));
-      return { ...next, activeSessionId: action.info.id };
+      return { ...next, activeSessionKey: key };
     }
 
-    case "session.selected":
-      if (!state.sessions[action.sessionId]) return state;
-      return { ...state, activeSessionId: action.sessionId };
+    case "session.selected": {
+      const key = makeSessionKey(action.hostName, action.sessionId);
+      if (!state.sessions[key]) return state;
+      return { ...state, activeSessionKey: key };
+    }
 
-    case "prompt.sent":
-      return updateSession(state, action.sessionId, (entry) => ({
+    case "prompt.sent": {
+      const key = makeSessionKey(action.hostName, action.sessionId);
+      return updateSession(state, key, (entry) => ({
         ...pushItem(entry, (id) => ({ kind: "user", id, text: action.text })),
         live: "streaming",
         error: undefined,
       }));
+    }
 
     case "daemon.event":
       return reduceDaemonEvent(state, action.frame);
@@ -221,7 +245,8 @@ export function reducer(state: AppState, action: Action): AppState {
         pendingApprovals: state.pendingApprovals.filter((a) => a.approvalId !== action.approvalId),
       };
       if (!approval) return next;
-      return updateSession(next, approval.sessionId, (entry) => ({
+      const key = makeSessionKey(approval.hostName, approval.sessionId);
+      return updateSession(next, key, (entry) => ({
         ...entry,
         transcript: entry.transcript.map((item) =>
           item.kind === "approval" && item.approvalId === action.approvalId
@@ -233,14 +258,54 @@ export function reducer(state: AppState, action: Action): AppState {
   }
 }
 
+function setFleetHost(state: AppState, hostName: string, patch: Partial<FleetHostEntry>): AppState {
+  const existing = state.fleet[hostName];
+  return {
+    ...state,
+    fleet: {
+      ...state.fleet,
+      [hostName]: existing
+        ? { ...existing, ...patch }
+        : {
+            host: state.hosts.find((h) => h.name === hostName) ?? {
+              name: hostName,
+              url: "",
+              token: "",
+            },
+            state: "disconnected",
+            ...patch,
+          },
+    },
+  };
+}
+
+function dropHostSessions(state: AppState, hostNames: string[]): AppState {
+  const prefixes = hostNames.map((h) => `${h}:`);
+  const sessions: Record<string, SessionEntry> = {};
+  const sessionOrder: string[] = [];
+  let activeSessionKey = state.activeSessionKey;
+  for (const key of state.sessionOrder) {
+    if (prefixes.some((p) => key.startsWith(p))) continue;
+    sessions[key] = state.sessions[key]!;
+    sessionOrder.push(key);
+  }
+  if (activeSessionKey && prefixes.some((p) => activeSessionKey!.startsWith(p))) {
+    activeSessionKey = sessionOrder[0];
+  }
+  return { ...state, sessions, sessionOrder, activeSessionKey };
+}
+
 function reduceDaemonEvent(state: AppState, frame: DaemonEventFrame): AppState {
   const params = asRecord(frame.params);
+  const sessionId = asString(params?.sessionId);
+  if (!sessionId) return state;
+  const key = makeSessionKey(frame.hostName, sessionId);
+
   switch (frame.method) {
     case EVENTS.TOKEN: {
-      const sessionId = asString(params?.sessionId);
       const text = asString(params?.text);
-      if (!sessionId || !text) return state;
-      return updateSession(state, sessionId, (entry) => {
+      if (!text) return state;
+      return updateSession(state, key, (entry) => {
         const last = entry.transcript.at(-1);
         if (last?.kind === "assistant") {
           return {
@@ -253,10 +318,9 @@ function reduceDaemonEvent(state: AppState, frame: DaemonEventFrame): AppState {
     }
 
     case EVENTS.THINKING: {
-      const sessionId = asString(params?.sessionId);
       const text = asString(params?.text);
-      if (!sessionId || !text) return state;
-      return updateSession(state, sessionId, (entry) => {
+      if (!text) return state;
+      return updateSession(state, key, (entry) => {
         const last = entry.transcript.at(-1);
         if (last?.kind === "thinking") {
           return {
@@ -269,11 +333,10 @@ function reduceDaemonEvent(state: AppState, frame: DaemonEventFrame): AppState {
     }
 
     case EVENTS.TOOL_CALL: {
-      const sessionId = asString(params?.sessionId);
       const callId = asString(params?.callId);
       const tool = asString(params?.tool);
-      if (!sessionId || !callId || !tool) return state;
-      return updateSession(state, sessionId, (entry) =>
+      if (!callId || !tool) return state;
+      return updateSession(state, key, (entry) =>
         pushItem(entry, (id) => ({
           kind: "tool",
           id,
@@ -286,19 +349,17 @@ function reduceDaemonEvent(state: AppState, frame: DaemonEventFrame): AppState {
     }
 
     case EVENTS.TOOL_RESULT: {
-      const sessionId = asString(params?.sessionId);
       const callId = asString(params?.callId);
       const tool = asString(params?.tool);
       const output = asString(params?.output) ?? "";
       const isError = params?.isError === true;
-      if (!sessionId || !callId || !tool) return state;
-      return updateSession(state, sessionId, (entry) => {
+      if (!callId || !tool) return state;
+      return updateSession(state, key, (entry) => {
         const index = findLastIndex(
           entry.transcript,
           (item) => item.kind === "tool" && item.callId === callId,
         );
         if (index === -1) {
-          // Result without a matching call (shouldn't happen) — surface it anyway.
           return pushItem(entry, (id) => ({
             kind: "tool",
             id,
@@ -318,18 +379,16 @@ function reduceDaemonEvent(state: AppState, frame: DaemonEventFrame): AppState {
     }
 
     case EVENTS.SESSION_STATE: {
-      const sessionId = asString(params?.sessionId);
       const wireState = asString(params?.state);
-      if (!sessionId || !wireState) return state;
+      if (!wireState) return state;
       const error = asString(params?.error);
-      return updateSession(state, sessionId, (entry) => {
+      return updateSession(state, key, (entry) => {
         switch (wireState) {
           case "idle":
             return { ...entry, live: "idle", error: undefined };
           case "streaming":
             return { ...entry, live: "streaming" };
           case "error":
-            // Abort is the normal cancel path — present it as "cancelled", not an error.
             if (error && /abort/i.test(error)) {
               return { ...entry, live: "cancelled", error: undefined };
             }
@@ -341,7 +400,7 @@ function reduceDaemonEvent(state: AppState, frame: DaemonEventFrame): AppState {
     }
 
     case "event.approval_request": {
-      const approval = parseApprovalRequest(params);
+      const approval = parseApprovalRequest(frame.hostName, params);
       if (!approval) return state;
       if (state.pendingApprovals.some((a) => a.approvalId === approval.approvalId)) {
         return state;
@@ -350,7 +409,7 @@ function reduceDaemonEvent(state: AppState, frame: DaemonEventFrame): AppState {
         ...state,
         pendingApprovals: [...state.pendingApprovals, approval],
       };
-      return updateSession(next, approval.sessionId, (entry) =>
+      return updateSession(next, key, (entry) =>
         pushItem(entry, (id) => ({
           kind: "approval",
           id,
@@ -372,8 +431,9 @@ function coarseToLive(coarse: SessionInfo["state"]): LiveSessionState {
   return coarse === "busy" ? "streaming" : "idle";
 }
 
-function stubEntry(sessionId: string): SessionEntry {
+function stubEntry(hostName: string, sessionId: string): SessionEntry {
   return {
+    hostName,
     info: {
       id: sessionId,
       cwd: "",
@@ -390,19 +450,20 @@ function stubEntry(sessionId: string): SessionEntry {
 
 function updateSession(
   state: AppState,
-  sessionId: string,
+  key: string,
   fn: (entry: SessionEntry) => SessionEntry,
 ): AppState {
-  const existing = state.sessions[sessionId];
-  const entry = existing ?? stubEntry(sessionId);
+  const existing = state.sessions[key];
+  const { hostName, sessionId } = parseSessionKey(key);
+  const entry = existing ?? stubEntry(hostName, sessionId);
   const updated = fn(entry);
   if (updated === entry && existing) return state;
   return {
     ...state,
-    sessions: { ...state.sessions, [sessionId]: updated },
-    sessionOrder: state.sessionOrder.includes(sessionId)
+    sessions: { ...state.sessions, [key]: updated },
+    sessionOrder: state.sessionOrder.includes(key)
       ? state.sessionOrder
-      : [...state.sessionOrder, sessionId],
+      : [...state.sessionOrder, key],
   };
 }
 
@@ -446,6 +507,7 @@ function asString(value: unknown): string | undefined {
 }
 
 function parseApprovalRequest(
+  hostName: string,
   params: Record<string, unknown> | undefined,
 ): PendingApproval | undefined {
   const sessionId = asString(params?.sessionId);
@@ -453,29 +515,36 @@ function parseApprovalRequest(
   const callId = asString(params?.callId);
   const tool = asString(params?.tool);
   if (!sessionId || !approvalId || !callId || !tool) return undefined;
-  return { sessionId, approvalId, callId, tool, args: params?.args };
+  return { hostName, sessionId, approvalId, callId, tool, args: params?.args };
 }
 
 // --- selectors ---------------------------------------------------------------
 
 export function selectSessions(state: AppState): SessionEntry[] {
   return state.sessionOrder
-    .map((id) => state.sessions[id])
+    .map((key) => state.sessions[key])
     .filter((entry): entry is SessionEntry => entry !== undefined);
 }
 
 export function selectActiveSession(state: AppState): SessionEntry | undefined {
-  return state.activeSessionId ? state.sessions[state.activeSessionId] : undefined;
+  return state.activeSessionKey ? state.sessions[state.activeSessionKey] : undefined;
 }
 
 export function selectCurrentApproval(state: AppState): PendingApproval | undefined {
   return state.pendingApprovals[0];
 }
 
-/** Short label for the sidebar: cwd basename, falling back to the session id. */
+export function selectConnectedHosts(state: AppState): FleetHostEntry[] {
+  return Object.values(state.fleet);
+}
+
+export function selectActiveHostName(state: AppState): string | undefined {
+  return state.activeSessionKey ? parseSessionKey(state.activeSessionKey).hostName : undefined;
+}
+
 export function sessionDisplayName(entry: SessionEntry): string {
   const base = basename(entry.info.cwd);
-  return base || `session ${entry.info.id.slice(0, 8)}`;
+  return `${entry.hostName}: ${base || entry.info.id.slice(0, 8)}`;
 }
 
 export function basename(cwd: string): string {

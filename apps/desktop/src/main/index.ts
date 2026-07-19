@@ -1,30 +1,28 @@
 import path from "node:path";
 
-import { CrowClient, CrowClientError } from "@crow/client";
-import { app, BrowserWindow, ipcMain, Menu } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, Notification } from "electron";
 
 import type {
   ApprovalRespondRequest,
-  ConnectResult,
   CreateSessionRequest,
   SendPromptRequest,
 } from "../shared/api.ts";
 import type { KnownHost } from "../shared/hosts.ts";
+import { ConnectionManager } from "./connection-manager.ts";
 import { loadHosts, removeHost, saveHosts, upsertHost } from "./hosts-store.ts";
 
 /**
- * Crow desktop main process. P2: one window, ONE daemon connection at a time
- * (multihost fan-out is P3 — see the report/notes in docs). All daemon events
- * are forwarded to the renderer as "daemon:event"; connection state changes as
- * "daemon:state".
+ * Crow desktop main process. P3: multihost fleet. The ConnectionManager holds
+ * one CrowClient per connected daemon and forwards events/state to the renderer
+ * stamped with the host name.
  */
 
 let mainWindow: BrowserWindow | undefined;
-let client: CrowClient | undefined;
-/** URL of the currently connected host — kept for loopback-aware cwd expansion. */
-let connectedUrl: string | undefined;
-
 const hostsFile = (): string => path.join(app.getPath("userData"), "hosts.json");
+
+function isFocused(): boolean {
+  return mainWindow?.isFocused() ?? false;
+}
 
 function broadcast(channel: "daemon:event" | "daemon:state", payload: unknown): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -32,37 +30,14 @@ function broadcast(channel: "daemon:event" | "daemon:state", payload: unknown): 
   }
 }
 
-function wireClient(next: CrowClient): void {
-  next.onEvent((method, params) => broadcast("daemon:event", { method, params }));
-  next.onStateChange((state) => broadcast("daemon:state", state));
-}
-
-async function disconnectClient(): Promise<void> {
-  const current = client;
-  client = undefined;
-  connectedUrl = undefined;
-  if (current) await current.close();
-}
-
-function requireClient(): CrowClient {
-  if (!client) throw new Error("not connected to a daemon");
-  return client;
-}
-
-/**
- * Expand a leading "~" against the local home dir. Only meaningful when the
- * daemon is on this machine (the P2 norm); for remote daemons the path is sent
- * verbatim and the daemon interprets it (P3 moves expansion daemon-side).
- */
-function expandHome(cwd: string): string {
-  if (!isLoopbackUrl(connectedUrl)) return cwd;
+function expandHome(cwd: string, url: string): string {
+  if (!isLoopbackUrl(url)) return cwd;
   if (cwd === "~") return app.getPath("home");
   if (cwd.startsWith("~/")) return path.join(app.getPath("home"), cwd.slice(2));
   return cwd;
 }
 
-function isLoopbackUrl(url: string | undefined): boolean {
-  if (!url) return false;
+function isLoopbackUrl(url: string): boolean {
   try {
     const hostname = new URL(url).hostname;
     return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
@@ -71,16 +46,12 @@ function isLoopbackUrl(url: string | undefined): boolean {
   }
 }
 
-function classifyConnectError(error: unknown): ConnectResult {
-  const message = error instanceof Error ? error.message : String(error);
-  if (error instanceof CrowClientError && message.includes("HTTP 401")) {
-    return { ok: false, kind: "auth", message };
-  }
-  if (/refused|host not found|timed out/.test(message)) {
-    return { ok: false, kind: "unreachable", message };
-  }
-  return { ok: false, kind: "error", message };
-}
+const manager = new ConnectionManager({
+  onEvent: (hostName, method, params) => broadcast("daemon:event", { hostName, method, params }),
+  onStateChange: (hostName, state) => broadcast("daemon:state", { hostName, state }),
+  Notification,
+  isFocused,
+});
 
 function registerIpc(): void {
   ipcMain.handle("hosts:list", () => loadHosts(hostsFile()));
@@ -92,49 +63,49 @@ function registerIpc(): void {
   });
 
   ipcMain.handle("hosts:remove", async (_event, name: string) => {
+    await manager.disconnect(name);
     const next = removeHost(await loadHosts(hostsFile()), name);
     await saveHosts(hostsFile(), next);
     return next;
   });
 
-  ipcMain.handle("host:connect", async (_event, host: KnownHost): Promise<ConnectResult> => {
-    await disconnectClient();
-    const next = new CrowClient({ url: host.url, token: host.token });
-    wireClient(next);
-    try {
-      await next.connect();
-      const info = await next.hostInfo();
-      client = next;
-      connectedUrl = host.url;
-      return { ok: true, info };
-    } catch (error) {
-      await next.close().catch(() => undefined);
-      return classifyConnectError(error);
-    }
+  ipcMain.handle("host:connect", (_event, host: KnownHost) => manager.add(host));
+
+  ipcMain.handle("host:disconnect", (_event, hostName: string) => manager.disconnect(hostName));
+
+  ipcMain.handle("host:reconnect", (_event, hostName: string) => {
+    const conn = manager.get(hostName);
+    if (!conn) throw new Error(`unknown host: ${hostName}`);
+    return manager.connect(conn.host);
   });
 
-  ipcMain.handle("host:disconnect", () => disconnectClient());
+  ipcMain.handle("fleet:list", () => manager.list());
 
-  ipcMain.handle("session:create", (_event, params: CreateSessionRequest) =>
-    requireClient().createSession({ ...params, cwd: expandHome(params.cwd) }),
+  ipcMain.handle("session:create", async (_event, params: CreateSessionRequest) => {
+    const conn = manager.get(params.hostName);
+    if (!conn) throw new Error(`unknown host: ${params.hostName}`);
+    return manager.createSession(params.hostName, {
+      ...params,
+      cwd: expandHome(params.cwd, conn.host.url),
+    });
+  });
+
+  ipcMain.handle("session:send", (_event, params: SendPromptRequest) =>
+    manager.sendPrompt(params.hostName, params.sessionId, params.text),
   );
 
-  ipcMain.handle("session:send", (_event, { sessionId, text }: SendPromptRequest) =>
-    requireClient().sendPrompt(sessionId, text),
+  ipcMain.handle("session:cancel", (_event, { hostName, sessionId }) =>
+    manager.cancelSession(hostName, sessionId),
   );
 
-  ipcMain.handle("session:cancel", (_event, sessionId: string) =>
-    requireClient().cancelSession(sessionId),
+  ipcMain.handle("session:list", (_event, hostName: string) => manager.listSessions(hostName));
+
+  ipcMain.handle("session:attach", (_event, { hostName, sessionId }) =>
+    manager.attachSession(hostName, sessionId),
   );
 
-  ipcMain.handle("session:list", () => requireClient().listSessions());
-
-  ipcMain.handle("session:attach", (_event, sessionId: string) =>
-    requireClient().attachSession(sessionId),
-  );
-
-  ipcMain.handle("approval:respond", (_event, { approvalId, decision }: ApprovalRespondRequest) =>
-    requireClient().respondApproval(approvalId, decision),
+  ipcMain.handle("approval:respond", (_event, params: ApprovalRespondRequest) =>
+    manager.respondApproval(params.hostName, params.approvalId, params.decision),
   );
 }
 
@@ -146,8 +117,6 @@ async function createWindow(): Promise<void> {
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(import.meta.dirname, "../preload/index.mjs"),
-      // ESM preload (.mjs) requires an unsandboxed renderer; context isolation
-      // and no node integration still apply.
       sandbox: false,
       contextIsolation: true,
       nodeIntegration: false,
@@ -163,7 +132,7 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
-  if (!app.isPackaged) Menu.setApplicationMenu(null); // P2 dev build: no menu bar
+  if (!app.isPackaged) Menu.setApplicationMenu(null);
   registerIpc();
   await createWindow();
 
@@ -173,7 +142,7 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
-  void disconnectClient().finally(() => {
+  void manager.closeAll().finally(() => {
     if (process.platform !== "darwin") app.quit();
   });
 });
