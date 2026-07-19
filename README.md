@@ -23,9 +23,9 @@ Committed so far:
 - **P0** — monorepo scaffold, CI, docs
 - **P1** — `crowd` daemon + `@crow/core` runtime (sessions, confined tools, skills)
 - **P2** — `@crow/client` + Electron desktop hub + tool-call approvals
-- **P3** — in progress (multihost fleet + `crow` CLI, not committed yet)
+- **P3** — multihost fleet in the desktop app + `crow` CLI
 
-See `docs/` for the architecture and protocol spec.
+See `docs/` for the architecture and protocol spec. Next: P4 sub-agents/teams.
 
 ## Repository layout
 
@@ -86,30 +86,32 @@ pnpm --filter @crow/daemon start   # terminal 1
 pnpm --filter @crow/desktop dev    # terminal 2
 ```
 
-Then in the desktop app add a host: `ws://127.0.0.1:7749` and the token from
-`~/.crow/daemon.json`.
-
-The app supports one host at a time in the committed P2 build; multihost fan-out
-is the current in-progress work (P3).
+Then in the desktop app add one or more hosts (e.g. `ws://127.0.0.1:7749`) with
+the token from `~/.crow/daemon.json`. The fleet sidebar supports multiple
+simultaneous hosts; chat sessions are scoped per host.
 
 ## Run the CLI
 
-> Not wired up in the committed P2 build yet — `apps/cli/` is the current P3
-> workstream.
-
-When it lands, the workflow will be:
+The CLI stores saved hosts in `~/.crow/hosts.json` (mode `600`).
 
 ```bash
 # Save a host
 crow hosts add local --url ws://127.0.0.1:7749 --token <token>
 
-# One-shot prompt
+# One-shot prompt (creates a session, sends, streams until idle)
 crow prompt "list the files here" --host local
 
 # Or send to an existing session
 crow sessions --host local
 crow send <session-id> "what does package.json do?" --host local --wait
+
+# Ad-hoc without saving
+crow info --url ws://127.0.0.1:7749 --token <token>
+crow prompt "hello" --url ws://127.0.0.1:7749 --token <token>
 ```
+
+If `crow` is not on your PATH, use `node apps/cli/src/bin.ts <args>` from the
+repo root (Node 22's type stripping runs the TS source directly).
 
 ## Tests
 
