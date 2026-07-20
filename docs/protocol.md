@@ -14,8 +14,9 @@ connection per (desktop, daemon) pair. Auth: bearer token presented in the
 | `session.cancel`            | `{ sessionId }`                                                                | `{}`                                                                           |
 | `session.list`              | `{}`                                                                           | `{ sessions: SessionInfo[] }`                                                  |
 | `session.attach`            | `{ sessionId, since? }`                                                        | `{}` (live events; P1 has no replay buffer, `since` is ignored)                |
-| `agent.spawn`               | `{ sessionId, prompt, tools?, host? }`                                         | `{ agentId }` (P4; `host` in P5)                                               |
-| `team.run`                  | `{ sessionId, team, input }`                                                   | `{ runId }` (P4)                                                               |
+| `agent.spawn`               | `{ prompt, cwd, systemPrompt?, tools?, model? }`                               | `{ agentId }` (P4; returns immediately, completion arrives via `event.agent`)  |
+| `team.list`                 | `{}`                                                                           | `{ teams: [{ name, description, agents: [{ name, role }] }] }` (P4)            |
+| `team.run`                  | `{ team, input, cwd, model? }`                                                 | `{ runId }` (P4; progress arrives via `event.team`)                            |
 | `workflow.run`              | `{ workflow, inputs }`                                                         | `{ runId }` (P6)                                                               |
 | `workflow.list`             | `{}`                                                                           | `{ workflows }` (P6)                                                           |
 | `cron.add`                  | `{ schedule, task }`                                                           | `{ jobId }` (P6)                                                               |
@@ -51,6 +52,21 @@ attached to that session and waits for a matching `approval.respond`:
   expired ids, or from connections not attached to the session, are ignored.
 - `approval.respond` is a notification: no `id`, no response frame.
 
+## Sub-agents and teams (P4)
+
+`agent.spawn` starts an independent agent run with its own tool set — `tools`
+whitelists names from the default coding set (`read`/`write`/`edit`/`bash`),
+absent means the full set — and returns `{ agentId }` immediately. `team.run`
+runs a named preset (`team.list` enumerates them) as a sequence of sub-agents
+whose outputs thread through, and returns `{ runId }` immediately. An unknown
+team name is an `INVALID_PARAMS` (-32602) error on the RPC itself.
+
+Both report progress as `event.agent` / `event.team` notifications broadcast to
+**every** connected client (not session-scoped, no attach needed). `event.team`
+`step` is 1-based; the final `done` carries the last agent's output. Run
+failures surface as the event with state `"error"` — never as an RPC error,
+because the RPC already returned.
+
 ## Events (daemon → client, as JSON-RPC notifications)
 
 | Method                   | Params                                                                                   |
@@ -61,6 +77,8 @@ attached to that session and waits for a matching `approval.respond`:
 | `event.tool_result`      | `{ sessionId, callId, tool, output, isError }`                                           |
 | `event.approval_request` | `{ sessionId, approvalId, callId, tool, args }` — client replies with `approval.respond` |
 | `event.session_state`    | `{ sessionId, state, error? }` — state is `"idle" \| "streaming" \| "error"`             |
+| `event.agent`            | `{ agentId, state, output?, error? }` — state is `"started" \| "done" \| "error"` (P4)   |
+| `event.team`             | `{ runId, state, step?, agent?, output?, error? }` (P4)                                  |
 | `event.job`              | `{ jobId, kind, detail }` (P6)                                                           |
 
 ## Notifications (client → daemon, no response)

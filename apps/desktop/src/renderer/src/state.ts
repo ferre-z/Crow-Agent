@@ -89,12 +89,49 @@ export interface FleetHostEntry {
   connecting?: boolean;
 }
 
+export type AgentRunState = "started" | "done" | "error";
+
+export interface AgentRun {
+  hostName: string;
+  agentId: string;
+  state: AgentRunState;
+  output?: string;
+  error?: string;
+  prompt: string;
+}
+
+export interface TeamRunStep {
+  step: number;
+  agent: string;
+  state: "running" | "done" | "error";
+  output?: string;
+  error?: string;
+}
+
+export type TeamRunState = "running" | "done" | "error";
+
+export interface TeamRun {
+  hostName: string;
+  runId: string;
+  team: string;
+  input: string;
+  state: TeamRunState;
+  steps: TeamRunStep[];
+  output?: string;
+  error?: string;
+}
+
+/** What the main pane shows: a session chat or a team run timeline. */
+export type ActiveView = { kind: "session"; key: string } | { kind: "team"; runId: string };
+
 export interface AppState {
   hosts: KnownHost[];
   fleet: Record<string, FleetHostEntry>;
   sessions: Record<string, SessionEntry>;
   sessionOrder: string[];
-  activeSessionKey?: string;
+  activeView?: ActiveView;
+  agentRuns: Record<string, AgentRun>;
+  teamRuns: Record<string, TeamRun>;
   pendingApprovals: PendingApproval[];
 }
 
@@ -111,6 +148,9 @@ export type Action =
   | { type: "session.created"; hostName: string; info: SessionInfo }
   | { type: "session.selected"; hostName: string; sessionId: string }
   | { type: "prompt.sent"; hostName: string; sessionId: string; text: string }
+  | { type: "agent.spawned"; hostName: string; agentId: string; prompt: string }
+  | { type: "team.started"; hostName: string; runId: string; team: string; input: string }
+  | { type: "team.selected"; hostName: string; runId: string }
   | { type: "daemon.event"; frame: DaemonEventFrame }
   | { type: "approval.responded"; approvalId: string; decision: ApprovalDecision };
 
@@ -120,12 +160,19 @@ export function initialState(): AppState {
     fleet: {},
     sessions: {},
     sessionOrder: [],
+    agentRuns: {},
+    teamRuns: {},
     pendingApprovals: [],
   };
 }
 
 export function makeSessionKey(hostName: string, sessionId: string): string {
   return `${hostName}:${sessionId}`;
+}
+
+/** Composite key for agent/team runs — the same id on two hosts stays distinct. */
+export function makeRunKey(hostName: string, runId: string): string {
+  return `${hostName}:${runId}`;
 }
 
 export function parseSessionKey(key: string): { hostName: string; sessionId: string } {
@@ -223,13 +270,13 @@ export function reducer(state: AppState, action: Action): AppState {
         info: action.info,
         live: coarseToLive(action.info.state),
       }));
-      return { ...next, activeSessionKey: key };
+      return { ...next, activeView: { kind: "session", key } };
     }
 
     case "session.selected": {
       const key = makeSessionKey(action.hostName, action.sessionId);
       if (!state.sessions[key]) return state;
-      return { ...state, activeSessionKey: key };
+      return { ...state, activeView: { kind: "session", key } };
     }
 
     case "prompt.sent": {
@@ -239,6 +286,40 @@ export function reducer(state: AppState, action: Action): AppState {
         live: "streaming",
         error: undefined,
       }));
+    }
+
+    case "agent.spawned": {
+      const key = makeRunKey(action.hostName, action.agentId);
+      const run: AgentRun = {
+        hostName: action.hostName,
+        agentId: action.agentId,
+        state: "started",
+        prompt: action.prompt,
+      };
+      return { ...state, agentRuns: { ...state.agentRuns, [key]: run } };
+    }
+
+    case "team.started": {
+      const key = makeRunKey(action.hostName, action.runId);
+      const run: TeamRun = {
+        hostName: action.hostName,
+        runId: action.runId,
+        team: action.team,
+        input: action.input,
+        state: "running",
+        steps: [],
+      };
+      return {
+        ...state,
+        teamRuns: { ...state.teamRuns, [key]: run },
+        activeView: { kind: "team", runId: key },
+      };
+    }
+
+    case "team.selected": {
+      const key = makeRunKey(action.hostName, action.runId);
+      if (!state.teamRuns[key]) return state;
+      return { ...state, activeView: { kind: "team", runId: key } };
     }
 
     case "daemon.event":
@@ -287,22 +368,38 @@ function setFleetHost(state: AppState, hostName: string, patch: Partial<FleetHos
 
 function dropHostSessions(state: AppState, hostNames: string[]): AppState {
   const prefixes = hostNames.map((h) => `${h}:`);
+  const dropped = (key: string): boolean => prefixes.some((p) => key.startsWith(p));
   const sessions: Record<string, SessionEntry> = {};
   const sessionOrder: string[] = [];
-  let activeSessionKey = state.activeSessionKey;
   for (const key of state.sessionOrder) {
-    if (prefixes.some((p) => key.startsWith(p))) continue;
+    if (dropped(key)) continue;
     sessions[key] = state.sessions[key]!;
     sessionOrder.push(key);
   }
-  if (activeSessionKey && prefixes.some((p) => activeSessionKey!.startsWith(p))) {
-    activeSessionKey = sessionOrder[0];
+  const agentRuns: Record<string, AgentRun> = {};
+  for (const [key, run] of Object.entries(state.agentRuns)) {
+    if (!dropped(key)) agentRuns[key] = run;
   }
-  return { ...state, sessions, sessionOrder, activeSessionKey };
+  const teamRuns: Record<string, TeamRun> = {};
+  for (const [key, run] of Object.entries(state.teamRuns)) {
+    if (!dropped(key)) teamRuns[key] = run;
+  }
+  let activeView = state.activeView;
+  if (activeView?.kind === "session" && dropped(activeView.key)) {
+    const fallback = sessionOrder[0];
+    activeView = fallback ? { kind: "session", key: fallback } : undefined;
+  } else if (activeView?.kind === "team" && dropped(activeView.runId)) {
+    activeView = undefined;
+  }
+  return { ...state, sessions, sessionOrder, agentRuns, teamRuns, activeView };
 }
 
 function reduceDaemonEvent(state: AppState, frame: DaemonEventFrame): AppState {
   const params = asRecord(frame.params);
+  // Agent/team events carry no sessionId — route them before the session guard.
+  if (frame.method === EVENTS.AGENT) return reduceAgentEvent(state, frame.hostName, params);
+  if (frame.method === EVENTS.TEAM) return reduceTeamEvent(state, frame.hostName, params);
+
   const sessionId = asString(params?.sessionId);
   if (!sessionId) return state;
   const key = makeSessionKey(frame.hostName, sessionId);
@@ -431,6 +528,99 @@ function reduceDaemonEvent(state: AppState, frame: DaemonEventFrame): AppState {
   }
 }
 
+function reduceAgentEvent(
+  state: AppState,
+  hostName: string,
+  params: Record<string, unknown> | undefined,
+): AppState {
+  const agentId = asString(params?.agentId);
+  const wireState = asString(params?.state);
+  if (!agentId || !wireState) return state;
+  const key = makeRunKey(hostName, agentId);
+  const run = state.agentRuns[key];
+  if (!run) return state;
+  let updated: AgentRun;
+  switch (wireState) {
+    case "started":
+      updated = { ...run, state: "started" };
+      break;
+    case "done":
+      updated = { ...run, state: "done", output: asString(params?.output) };
+      break;
+    case "error":
+      updated = { ...run, state: "error", error: asString(params?.error) };
+      break;
+    default:
+      return state;
+  }
+  return { ...state, agentRuns: { ...state.agentRuns, [key]: updated } };
+}
+
+function reduceTeamEvent(
+  state: AppState,
+  hostName: string,
+  params: Record<string, unknown> | undefined,
+): AppState {
+  const runId = asString(params?.runId);
+  const wireState = asString(params?.state);
+  if (!runId || !wireState) return state;
+  const key = makeRunKey(hostName, runId);
+  const run = state.teamRuns[key];
+  if (!run) return state;
+
+  switch (wireState) {
+    case "step_started": {
+      const step = asNumber(params?.step);
+      const agent = asString(params?.agent);
+      if (step === undefined || !agent) return state;
+      const next: TeamRunStep = { step, agent, state: "running" };
+      const steps = run.steps.some((s) => s.step === step)
+        ? run.steps.map((s) => (s.step === step ? next : s))
+        : [...run.steps, next];
+      return { ...state, teamRuns: { ...state.teamRuns, [key]: { ...run, steps } } };
+    }
+
+    case "step_done": {
+      const step = asNumber(params?.step);
+      const output = asString(params?.output);
+      const index = run.steps.findIndex(
+        (s) =>
+          (step !== undefined ? s.step === step : s.state === "running") && s.state === "running",
+      );
+      if (index === -1) return state;
+      const steps = run.steps.map((s, i) =>
+        i === index ? { ...s, state: "done" as const, output } : s,
+      );
+      return { ...state, teamRuns: { ...state.teamRuns, [key]: { ...run, steps } } };
+    }
+
+    case "done":
+      return {
+        ...state,
+        teamRuns: {
+          ...state.teamRuns,
+          [key]: { ...run, state: "done", output: asString(params?.output) },
+        },
+      };
+
+    case "error": {
+      const error = asString(params?.error);
+      const step = asNumber(params?.step);
+      const steps = run.steps.map((s) => {
+        const failed = step !== undefined ? s.step === step : s.state === "running";
+        return failed && s.state === "running" ? { ...s, state: "error" as const, error } : s;
+      });
+      return {
+        ...state,
+        teamRuns: { ...state.teamRuns, [key]: { ...run, state: "error", error, steps } },
+      };
+    }
+
+    default:
+      return state;
+  }
+}
+
 // --- internals ---------------------------------------------------------------
 
 function coarseToLive(coarse: SessionInfo["state"]): LiveSessionState {
@@ -512,6 +702,10 @@ function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function parseApprovalRequest(
   hostName: string,
   params: Record<string, unknown> | undefined,
@@ -533,7 +727,7 @@ export function selectSessions(state: AppState): SessionEntry[] {
 }
 
 export function selectActiveSession(state: AppState): SessionEntry | undefined {
-  return state.activeSessionKey ? state.sessions[state.activeSessionKey] : undefined;
+  return state.activeView?.kind === "session" ? state.sessions[state.activeView.key] : undefined;
 }
 
 export function selectCurrentApproval(state: AppState): PendingApproval | undefined {
@@ -544,8 +738,23 @@ export function selectConnectedHosts(state: AppState): FleetHostEntry[] {
   return Object.values(state.fleet);
 }
 
+export function selectTeamRuns(state: AppState): TeamRun[] {
+  return Object.values(state.teamRuns);
+}
+
+export function selectAgentRuns(state: AppState): AgentRun[] {
+  return Object.values(state.agentRuns);
+}
+
+export function selectActiveTeamRun(state: AppState): TeamRun | undefined {
+  return state.activeView?.kind === "team" ? state.teamRuns[state.activeView.runId] : undefined;
+}
+
 export function selectActiveHostName(state: AppState): string | undefined {
-  return state.activeSessionKey ? parseSessionKey(state.activeSessionKey).hostName : undefined;
+  const view = state.activeView;
+  if (view?.kind === "session") return parseSessionKey(view.key).hostName;
+  if (view?.kind === "team") return state.teamRuns[view.runId]?.hostName;
+  return undefined;
 }
 
 export function sessionDisplayName(entry: SessionEntry): string {

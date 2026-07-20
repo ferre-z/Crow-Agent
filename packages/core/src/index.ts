@@ -37,6 +37,9 @@ export { buildSystemPrompt, loadCrowSkills } from "./skills.ts";
 export {
   CrowSession,
   CrowSessionManager,
+  buildSessionHarness,
+  type BuildSessionHarnessOptions,
+  type BuiltSessionHarness,
   type CreateSessionOptions,
   type CrowSessionEvent,
   type CrowSessionInfo,
@@ -44,6 +47,22 @@ export {
   type CrowSessionManagerOptions,
   type CrowSessionState,
 } from "./session.ts";
+export {
+  DEFAULT_SUBAGENT_PROMPT,
+  SubAgentRunner,
+  type SpawnSubAgentOptions,
+  type SubAgentHandle,
+  type SubAgentRunnerOptions,
+} from "./subagents.ts";
+export {
+  TEAM_PRESETS,
+  TeamRunner,
+  type RunTeamOptions,
+  type TeamAgentSpec,
+  type TeamPreset,
+  type TeamRunEvent,
+  type TeamRunEventListener,
+} from "./teams.ts";
 // Re-exported for @crow/daemon, which intentionally has no direct pi-ai dependency.
 export type { Models } from "@earendil-works/pi-ai";
 export * as testing from "./testing/faux.ts";

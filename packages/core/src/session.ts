@@ -224,6 +224,63 @@ export interface CrowSessionManagerOptions {
   defaultModelRef?: string;
 }
 
+export interface BuildSessionHarnessOptions {
+  cwd: string;
+  models: Models;
+  modelRef: string;
+  sessionsRoot: string;
+  /** Base system prompt; loaded skill instructions are appended to it. */
+  baseSystemPrompt: string;
+  /** Whitelist of default coding tool names; absent means the full set. */
+  tools?: string[];
+  /** Daemon-trusted skill dirs (typically outside cwd, e.g. ~/.crow/skills). */
+  skillDirs?: string[];
+}
+
+export interface BuiltSessionHarness {
+  harness: AgentHarness;
+  sessionId: string;
+  createdAt: string;
+}
+
+/**
+ * Shared session construction for interactive sessions (CrowSessionManager)
+ * and one-shot sub-agents (SubAgentRunner): confined env + default coding
+ * tools (optionally whitelisted) + pi session log + harness.
+ */
+export async function buildSessionHarness(
+  options: BuildSessionHarnessOptions,
+): Promise<BuiltSessionHarness> {
+  const model = resolveModelRef(options.models, options.modelRef);
+  const nodeEnv = new NodeExecutionEnv({ cwd: options.cwd });
+  const confined = new ConfinedExecutionEnv(nodeEnv, options.cwd);
+  const repo = new JsonlSessionRepo({ fs: nodeEnv, sessionsRoot: options.sessionsRoot });
+  const session = await repo.create({ cwd: options.cwd });
+  let tools = createCodingTools(confined);
+  if (options.tools) {
+    const allowed = new Set(options.tools);
+    tools = tools.filter((tool) => allowed.has(tool.name));
+  }
+  // Skills are daemon-trusted config and typically live outside the session
+  // cwd (~/.crow/skills), so they load through the unconfined env on purpose.
+  let skills: Skill[] = [];
+  if (options.skillDirs?.length) {
+    skills = (await loadCrowSkills(nodeEnv, options.skillDirs)).skills;
+  }
+  const systemPrompt = buildSystemPrompt(options.baseSystemPrompt, skills);
+  const harness = new AgentHarness({
+    env: confined,
+    session,
+    models: options.models,
+    model,
+    tools,
+    resources: { skills },
+    systemPrompt,
+  });
+  const metadata = await session.getMetadata();
+  return { harness, sessionId: metadata.id, createdAt: metadata.createdAt };
+}
+
 export interface CreateSessionOptions {
   cwd: string;
   modelRef?: string;
@@ -254,29 +311,14 @@ export class CrowSessionManager {
 
   async create(options: CreateSessionOptions): Promise<CrowSession> {
     const modelRef = options.modelRef ?? this.defaultModelRef;
-    const model = resolveModelRef(this.models, modelRef);
-    const nodeEnv = new NodeExecutionEnv({ cwd: options.cwd });
-    const confined = new ConfinedExecutionEnv(nodeEnv, options.cwd);
-    const repo = new JsonlSessionRepo({ fs: nodeEnv, sessionsRoot: this.sessionsRoot });
-    const session = await repo.create({ cwd: options.cwd });
-    const tools = createCodingTools(confined);
-    // Skills are daemon-trusted config and typically live outside the session
-    // cwd (~/.crow/skills), so they load through the unconfined env on purpose.
-    let skills: Skill[] = [];
-    if (options.skillDirs?.length) {
-      skills = (await loadCrowSkills(nodeEnv, options.skillDirs)).skills;
-    }
-    const systemPrompt = buildSystemPrompt(options.systemPrompt ?? DEFAULT_BASE_PROMPT, skills);
-    const harness = new AgentHarness({
-      env: confined,
-      session,
+    const built = await buildSessionHarness({
+      cwd: options.cwd,
       models: this.models,
-      model,
-      tools,
-      resources: { skills },
-      systemPrompt,
+      modelRef,
+      sessionsRoot: this.sessionsRoot,
+      baseSystemPrompt: options.systemPrompt ?? DEFAULT_BASE_PROMPT,
+      ...(options.skillDirs !== undefined ? { skillDirs: options.skillDirs } : {}),
     });
-    const metadata = await session.getMetadata();
     const approvalGate = new ApprovalGate({
       ...(options.approvalMode !== undefined ? { mode: options.approvalMode } : {}),
       ...(options.autoApproveTools !== undefined
@@ -285,11 +327,11 @@ export class CrowSessionManager {
       ...(options.approvalAsk !== undefined ? { ask: options.approvalAsk } : {}),
     });
     const crowSession = new CrowSession({
-      id: metadata.id,
+      id: built.sessionId,
       cwd: options.cwd,
-      harness,
+      harness: built.harness,
       modelRef,
-      createdAt: metadata.createdAt,
+      createdAt: built.createdAt,
       approvalGate,
     });
     this.sessions.set(crowSession.id, crowSession);

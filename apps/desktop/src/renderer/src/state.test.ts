@@ -5,13 +5,17 @@ import type { DaemonEventFrame, HostInfoResult } from "../../shared/api.ts";
 import {
   basename,
   initialState,
+  makeRunKey,
   makeSessionKey,
   reducer,
   selectActiveHostName,
   selectActiveSession,
+  selectActiveTeamRun,
+  selectAgentRuns,
   selectConnectedHosts,
   selectCurrentApproval,
   selectSessions,
+  selectTeamRuns,
   sessionDisplayName,
   type Action,
   type AppState,
@@ -232,7 +236,7 @@ describe("session tracking", () => {
       hostName: "local",
       info: sessionInfo("s9", "/proj", "busy"),
     });
-    expect(state.activeSessionKey).toBe("local:s9");
+    expect(state.activeView).toEqual({ kind: "session", key: "local:s9" });
     expect(entry(state, "local", "s9").info.cwd).toBe("/proj");
     expect(entry(state, "local", "s9").live).toBe("streaming");
   });
@@ -240,9 +244,9 @@ describe("session tracking", () => {
   it("session.selected switches only to known composite keys", () => {
     let state = connectedState("local", [sessionInfo("s1", "/a")]);
     state = reducer(state, { type: "session.selected", hostName: "local", sessionId: "nope" });
-    expect(state.activeSessionKey).toBeUndefined();
+    expect(state.activeView).toBeUndefined();
     state = reducer(state, { type: "session.selected", hostName: "local", sessionId: "s1" });
-    expect(state.activeSessionKey).toBe("local:s1");
+    expect(state.activeView).toEqual({ kind: "session", key: "local:s1" });
     expect(selectActiveSession(state)?.info.id).toBe("s1");
   });
 
@@ -569,6 +573,291 @@ describe("approvals", () => {
     state = reducer(state, { type: "approval.responded", approvalId: "ghost", decision: "deny" });
     expect(state.pendingApprovals).toEqual([]);
     expect(entry(state, "local", "s1").transcript).toEqual([]);
+  });
+});
+
+describe("agent runs", () => {
+  it("agent.spawned records a started run with its prompt", () => {
+    let state = connectedState("local");
+    state = reducer(state, {
+      type: "agent.spawned",
+      hostName: "local",
+      agentId: "a1",
+      prompt: "fix the flaky test",
+    });
+    const run = state.agentRuns[makeRunKey("local", "a1")];
+    expect(run).toMatchObject({
+      hostName: "local",
+      agentId: "a1",
+      state: "started",
+      prompt: "fix the flaky test",
+    });
+    expect(selectAgentRuns(state)).toHaveLength(1);
+  });
+
+  it("event.agent done completes the run with output", () => {
+    let state = connectedState("local");
+    state = reducer(state, {
+      type: "agent.spawned",
+      hostName: "local",
+      agentId: "a1",
+      prompt: "p",
+    });
+    state = reducer(state, event("local", "event.agent", { agentId: "a1", state: "started" }));
+    state = reducer(
+      state,
+      event("local", "event.agent", { agentId: "a1", state: "done", output: "all green" }),
+    );
+    const run = state.agentRuns[makeRunKey("local", "a1")];
+    expect(run?.state).toBe("done");
+    expect(run?.output).toBe("all green");
+  });
+
+  it("event.agent error fails the run with its message", () => {
+    let state = connectedState("local");
+    state = reducer(state, {
+      type: "agent.spawned",
+      hostName: "local",
+      agentId: "a1",
+      prompt: "p",
+    });
+    state = reducer(
+      state,
+      event("local", "event.agent", { agentId: "a1", state: "error", error: "boom" }),
+    );
+    const run = state.agentRuns[makeRunKey("local", "a1")];
+    expect(run?.state).toBe("error");
+    expect(run?.error).toBe("boom");
+  });
+
+  it("ignores event.agent for an unknown agentId and malformed payloads", () => {
+    const state = connectedState("local");
+    const cases: Action[] = [
+      event("local", "event.agent", { agentId: "ghost", state: "done", output: "x" }),
+      event("local", "event.agent", { state: "done" }),
+      event("local", "event.agent", { agentId: "a1" }),
+      event("local", "event.agent", { agentId: "a1", state: "bogus" }),
+    ];
+    for (const action of cases) {
+      expect(reducer(state, action)).toBe(state);
+    }
+  });
+
+  it("keeps the same agentId on two hosts isolated", () => {
+    let state = connectedState("local");
+    state = reducer(state, {
+      type: "hosts.set",
+      hosts: [...state.hosts, { name: "pi", url: "ws://pi", token: "t" }],
+    });
+    state = reducer(state, { type: "connect.succeeded", hostName: "pi", info: HOST_INFO });
+    state = reducer(state, {
+      type: "agent.spawned",
+      hostName: "local",
+      agentId: "a1",
+      prompt: "local",
+    });
+    state = reducer(state, { type: "agent.spawned", hostName: "pi", agentId: "a1", prompt: "pi" });
+    state = reducer(
+      state,
+      event("pi", "event.agent", { agentId: "a1", state: "done", output: "pi-out" }),
+    );
+    expect(state.agentRuns[makeRunKey("local", "a1")]?.state).toBe("started");
+    expect(state.agentRuns[makeRunKey("pi", "a1")]?.output).toBe("pi-out");
+  });
+});
+
+describe("team runs", () => {
+  function startedRun(state: AppState, hostName = "local", runId = "r1"): AppState {
+    return reducer(state, { type: "team.started", hostName, runId, team: "review", input: "go" });
+  }
+
+  it("team.started records a running run and makes it the active view", () => {
+    let state = connectedState("local");
+    state = startedRun(state);
+    const run = state.teamRuns[makeRunKey("local", "r1")];
+    expect(run).toMatchObject({
+      hostName: "local",
+      runId: "r1",
+      team: "review",
+      input: "go",
+      state: "running",
+      steps: [],
+    });
+    expect(state.activeView).toEqual({ kind: "team", runId: makeRunKey("local", "r1") });
+    expect(selectActiveTeamRun(state)?.team).toBe("review");
+    expect(selectActiveHostName(state)).toBe("local");
+  });
+
+  it("team.selected switches the active view only to known runs", () => {
+    let state = connectedState("local", [sessionInfo("s1", "/a")]);
+    state = startedRun(state);
+    state = reducer(state, { type: "team.selected", hostName: "local", runId: "ghost" });
+    expect(state.activeView).toEqual({ kind: "team", runId: makeRunKey("local", "r1") });
+    state = reducer(state, { type: "session.selected", hostName: "local", sessionId: "s1" });
+    expect(state.activeView).toEqual({ kind: "session", key: "local:s1" });
+    state = reducer(state, { type: "team.selected", hostName: "local", runId: "r1" });
+    expect(state.activeView).toEqual({ kind: "team", runId: makeRunKey("local", "r1") });
+  });
+
+  it("sequences step_started and step_done into the run's step list", () => {
+    let state = connectedState("local");
+    state = startedRun(state);
+    state = reducer(
+      state,
+      event("local", "event.team", { runId: "r1", state: "step_started", step: 1, agent: "ana" }),
+    );
+    state = reducer(
+      state,
+      event("local", "event.team", {
+        runId: "r1",
+        state: "step_done",
+        step: 1,
+        output: "notes",
+      }),
+    );
+    state = reducer(
+      state,
+      event("local", "event.team", { runId: "r1", state: "step_started", step: 2, agent: "bob" }),
+    );
+    const run = state.teamRuns[makeRunKey("local", "r1")];
+    expect(run?.steps).toEqual([
+      { step: 1, agent: "ana", state: "done", output: "notes" },
+      { step: 2, agent: "bob", state: "running" },
+    ]);
+    expect(run?.state).toBe("running");
+  });
+
+  it("step_done without a step number completes the currently running step", () => {
+    let state = connectedState("local");
+    state = startedRun(state);
+    state = reducer(
+      state,
+      event("local", "event.team", { runId: "r1", state: "step_started", step: 1, agent: "ana" }),
+    );
+    state = reducer(
+      state,
+      event("local", "event.team", { runId: "r1", state: "step_done", output: "x" }),
+    );
+    expect(state.teamRuns[makeRunKey("local", "r1")]?.steps[0]).toMatchObject({
+      state: "done",
+      output: "x",
+    });
+  });
+
+  it("done marks the run done with the final output", () => {
+    let state = connectedState("local");
+    state = startedRun(state);
+    state = reducer(
+      state,
+      event("local", "event.team", { runId: "r1", state: "step_started", step: 1, agent: "ana" }),
+    );
+    state = reducer(
+      state,
+      event("local", "event.team", { runId: "r1", state: "done", output: "final answer" }),
+    );
+    const run = state.teamRuns[makeRunKey("local", "r1")];
+    expect(run?.state).toBe("done");
+    expect(run?.output).toBe("final answer");
+    expect(selectTeamRuns(state)).toHaveLength(1);
+  });
+
+  it("error fails the run and any in-flight step", () => {
+    let state = connectedState("local");
+    state = startedRun(state);
+    state = reducer(
+      state,
+      event("local", "event.team", { runId: "r1", state: "step_started", step: 1, agent: "ana" }),
+    );
+    state = reducer(
+      state,
+      event("local", "event.team", { runId: "r1", state: "error", error: "agent crashed" }),
+    );
+    const run = state.teamRuns[makeRunKey("local", "r1")];
+    expect(run?.state).toBe("error");
+    expect(run?.error).toBe("agent crashed");
+    expect(run?.steps[0]).toMatchObject({ state: "error", error: "agent crashed" });
+  });
+
+  it("error with a step number fails only that step", () => {
+    let state = connectedState("local");
+    state = startedRun(state);
+    state = reducer(
+      state,
+      event("local", "event.team", { runId: "r1", state: "step_started", step: 1, agent: "ana" }),
+    );
+    state = reducer(
+      state,
+      event("local", "event.team", {
+        runId: "r1",
+        state: "error",
+        step: 1,
+        agent: "ana",
+        error: "tool denied",
+      }),
+    );
+    const run = state.teamRuns[makeRunKey("local", "r1")];
+    expect(run?.state).toBe("error");
+    expect(run?.steps[0]).toMatchObject({ step: 1, state: "error", error: "tool denied" });
+  });
+
+  it("ignores event.team for unknown runs, wrong hosts, and malformed payloads", () => {
+    let state = connectedState("local");
+    state = startedRun(state);
+    const before = state;
+    const cases: Action[] = [
+      event("local", "event.team", { runId: "ghost", state: "done", output: "x" }),
+      event("pi", "event.team", { runId: "r1", state: "done", output: "x" }),
+      event("local", "event.team", { state: "done" }),
+      event("local", "event.team", { runId: "r1" }),
+      event("local", "event.team", { runId: "r1", state: "bogus" }),
+      event("local", "event.team", { runId: "r1", state: "step_started", agent: "ana" }),
+      event("local", "event.team", { runId: "r1", state: "step_done", step: 9, output: "x" }),
+    ];
+    for (const action of cases) {
+      expect(reducer(state, action)).toBe(before);
+    }
+  });
+
+  it("host.disconnect drops that host's runs and clears a team active view", () => {
+    let state = connectedState("local", [sessionInfo("s1", "/a")]);
+    state = startedRun(state);
+    state = reducer(state, {
+      type: "agent.spawned",
+      hostName: "local",
+      agentId: "a1",
+      prompt: "p",
+    });
+    state = reducer(state, { type: "host.disconnect", hostName: "local" });
+    expect(selectTeamRuns(state)).toEqual([]);
+    expect(selectAgentRuns(state)).toEqual([]);
+    expect(state.activeView).toBeUndefined();
+  });
+
+  it("host.disconnect falls back to a surviving session when the active one is dropped", () => {
+    let state = connectedState("local", [sessionInfo("s1", "/a")]);
+    state = reducer(state, {
+      type: "hosts.set",
+      hosts: [...state.hosts, { name: "pi", url: "ws://pi", token: "t" }],
+    });
+    state = reducer(state, { type: "connect.succeeded", hostName: "pi", info: HOST_INFO });
+    state = reducer(state, {
+      type: "sessions.set",
+      hostName: "pi",
+      sessions: [sessionInfo("s2", "/b")],
+    });
+    state = reducer(state, { type: "session.selected", hostName: "local", sessionId: "s1" });
+    state = reducer(state, { type: "host.disconnect", hostName: "local" });
+    expect(state.activeView).toEqual({ kind: "session", key: "pi:s2" });
+    // Runs on surviving hosts are kept.
+    state = reducer(state, {
+      type: "team.started",
+      hostName: "pi",
+      runId: "r9",
+      team: "t",
+      input: "i",
+    });
+    state = reducer(state, { type: "host.disconnect", hostName: "local" });
+    expect(state.teamRuns[makeRunKey("pi", "r9")]).toBeDefined();
   });
 });
 

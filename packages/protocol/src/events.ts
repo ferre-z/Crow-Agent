@@ -11,6 +11,8 @@ export const EVENTS = {
   TOOL_RESULT: "event.tool_result",
   SESSION_STATE: "event.session_state",
   APPROVAL_REQUEST: "event.approval_request",
+  AGENT: "event.agent",
+  TEAM: "event.team",
 } as const;
 
 export const sessionStateSchema = z.enum(["idle", "streaming", "error"]);
@@ -66,6 +68,33 @@ export const approvalRequestEventSchema = z.object({
 });
 export type ApprovalRequestEvent = z.infer<typeof approvalRequestEventSchema>;
 
+/**
+ * Sub-agent lifecycle (P4). Broadcast to every connected client — not
+ * session-scoped. "done" carries `output`; "error" carries `error`.
+ */
+export const agentEventSchema = z.object({
+  agentId: z.string(),
+  state: z.enum(["started", "done", "error"]),
+  output: z.string().optional(),
+  error: z.string().optional(),
+});
+export type AgentEvent = z.infer<typeof agentEventSchema>;
+
+/**
+ * Team run progress (P4). Broadcast to every connected client. `step` is
+ * 1-based; the final "done" carries the last agent's `output`. A step failure
+ * surfaces as "error" with `step`/`agent`/`error` set.
+ */
+export const teamEventSchema = z.object({
+  runId: z.string(),
+  state: z.enum(["step_started", "step_done", "done", "error"]),
+  step: z.number().int().min(1).optional(),
+  agent: z.string().optional(),
+  output: z.string().optional(),
+  error: z.string().optional(),
+});
+export type TeamEvent = z.infer<typeof teamEventSchema>;
+
 /** Params validator per event method. */
 export const eventParamsSchemas = {
   [EVENTS.TOKEN]: tokenEventSchema,
@@ -74,4 +103,6 @@ export const eventParamsSchemas = {
   [EVENTS.TOOL_RESULT]: toolResultEventSchema,
   [EVENTS.SESSION_STATE]: sessionStateEventSchema,
   [EVENTS.APPROVAL_REQUEST]: approvalRequestEventSchema,
+  [EVENTS.AGENT]: agentEventSchema,
+  [EVENTS.TEAM]: teamEventSchema,
 } as const;

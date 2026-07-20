@@ -563,4 +563,132 @@ describe("CrowDaemon", () => {
       }, "session back to idle");
     });
   });
+
+  describe("sub-agents and teams (P4)", () => {
+    const teamEvents = (client: TestClient) =>
+      client.notifications.filter((n) => n.method === EVENTS.TEAM).map((n) => n.params ?? {});
+
+    it("spawns a sub-agent and broadcasts started/done to every client", async () => {
+      faux.setResponses([testing.fauxAssistantMessage([testing.fauxText("sub-agent output")])]);
+      const spawner = await openClient();
+      const observer = await openClient(); // connected, not the spawner
+
+      const spawned = (await spawner.call(METHODS.AGENT_SPAWN, {
+        prompt: "do the thing",
+        cwd: workdir,
+      })) as { agentId: string };
+      expect(spawned.agentId).toMatch(/^agent_/);
+
+      await waitFor(
+        () =>
+          spawner.notifications.some(
+            (n) => n.method === EVENTS.AGENT && n.params?.state === "done",
+          ),
+        "event.agent done",
+      );
+
+      for (const client of [spawner, observer]) {
+        const events = client.notifications
+          .filter((n) => n.method === EVENTS.AGENT)
+          .map((n) => n.params ?? {});
+        expect(events[0]).toMatchObject({ agentId: spawned.agentId, state: "started" });
+        expect(events.at(-1)).toMatchObject({
+          agentId: spawned.agentId,
+          state: "done",
+          output: "sub-agent output",
+        });
+      }
+    });
+
+    it("surfaces a run failure as an event.agent error, not an RPC error", async () => {
+      faux.setResponses([
+        testing.fauxAssistantMessage("boom", { stopReason: "error", errorMessage: "kaboom" }),
+      ]);
+      const client = await openClient();
+
+      const spawned = (await client.call(METHODS.AGENT_SPAWN, {
+        prompt: "go",
+        cwd: workdir,
+      })) as { agentId: string };
+
+      await waitFor(
+        () =>
+          client.notifications.some(
+            (n) => n.method === EVENTS.AGENT && n.params?.state === "error",
+          ),
+        "event.agent error",
+      );
+      const errorEvent = client.notifications.find(
+        (n) => n.method === EVENTS.AGENT && n.params?.state === "error",
+      );
+      expect(errorEvent?.params).toMatchObject({ agentId: spawned.agentId, error: "kaboom" });
+    });
+
+    it("lists the built-in team presets", async () => {
+      const client = await openClient();
+      const listed = (await client.call(METHODS.TEAM_LIST, {})) as {
+        teams: { name: string; description: string; agents: { name: string; role: string }[] }[];
+      };
+      const byName = new Map(listed.teams.map((team) => [team.name, team]));
+      expect(byName.has("plan-implement-review")).toBe(true);
+      expect(byName.has("solo-review")).toBe(true);
+      const pir = byName.get("plan-implement-review");
+      expect(pir?.description).toBeTruthy();
+      expect(pir?.agents.map((a) => a.name)).toEqual(["planner", "implementer", "reviewer"]);
+      for (const team of listed.teams) {
+        for (const agent of team.agents) {
+          expect(agent.role).toBeTruthy();
+        }
+      }
+    });
+
+    it("runs a team and broadcasts the step sequence plus final done", async () => {
+      faux.setResponses([
+        testing.fauxAssistantMessage([testing.fauxText("PLAN: step one")]),
+        testing.fauxAssistantMessage([testing.fauxText("IMPLEMENTED")]),
+        testing.fauxAssistantMessage([testing.fauxText("VERDICT: acceptable")]),
+      ]);
+      const spawner = await openClient();
+      const observer = await openClient();
+
+      const started = (await spawner.call(METHODS.TEAM_RUN, {
+        team: "plan-implement-review",
+        input: "add a feature",
+        cwd: workdir,
+      })) as { runId: string };
+      expect(started.runId).toMatch(/^run_/);
+
+      await waitFor(
+        () =>
+          spawner.notifications.some((n) => n.method === EVENTS.TEAM && n.params?.state === "done"),
+        "event.team done",
+      );
+
+      const expected = [
+        { state: "step_started", step: 1, agent: "planner" },
+        { state: "step_done", step: 1, agent: "planner", output: "PLAN: step one" },
+        { state: "step_started", step: 2, agent: "implementer" },
+        { state: "step_done", step: 2, agent: "implementer", output: "IMPLEMENTED" },
+        { state: "step_started", step: 3, agent: "reviewer" },
+        { state: "step_done", step: 3, agent: "reviewer", output: "VERDICT: acceptable" },
+        { state: "done", output: "VERDICT: acceptable" },
+      ];
+      for (const client of [spawner, observer]) {
+        const events = teamEvents(client);
+        expect(events).toHaveLength(expected.length);
+        for (const [index, want] of expected.entries()) {
+          expect(events[index]).toMatchObject({ runId: started.runId, ...want });
+        }
+      }
+    });
+
+    it("rejects an unknown team with INVALID_PARAMS", async () => {
+      const client = await openClient();
+      await expect(
+        client.call(METHODS.TEAM_RUN, { team: "no-such-team", input: "x", cwd: workdir }),
+      ).rejects.toMatchObject({ code: RPC_ERRORS.INVALID_PARAMS });
+      // No run was started, so no team events flow.
+      expect(teamEvents(client)).toHaveLength(0);
+    });
+  });
 });

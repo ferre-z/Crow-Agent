@@ -26,6 +26,7 @@ interface FakeClientConfig {
   hostInfo?: HostInfoResult;
   sessions?: SessionInfo[];
   createSessionId?: string;
+  callResult?: unknown;
 }
 
 const mocks = vi.hoisted(() => {
@@ -100,6 +101,13 @@ const mocks = vi.hoisted(() => {
 
     respondApproval(approvalId: string, decision: ApprovalDecision): void {
       this.respondApprovalCalls.push({ approvalId, decision });
+    }
+
+    callCalls: { method: string; params: unknown }[] = [];
+
+    async call<T = unknown>(method: string, params?: unknown): Promise<T> {
+      this.callCalls.push({ method, params });
+      return this.config.callResult as T;
     }
 
     onEvent(listener: DaemonEventListener): () => void {
@@ -292,6 +300,28 @@ describe("ConnectionManager", () => {
     const client = mocks.FakeCrowClient.clients[mocks.FakeCrowClient.clients.length - 1]!;
     manager.respondApproval("local", "a1", "allow");
     expect(client.respondApprovalCalls).toEqual([{ approvalId: "a1", decision: "allow" }]);
+  });
+
+  it("call passes method and params through to the connected client", async () => {
+    const { manager } = createManager();
+    await manager.connect(host("local"));
+    const client = mocks.FakeCrowClient.clients[mocks.FakeCrowClient.clients.length - 1]!;
+    client.setConfig({ callResult: { agentId: "agent-1" } });
+    const result = await manager.call<{ agentId: string }>("local", "agent.spawn", {
+      prompt: "hi",
+      cwd: "/tmp",
+    });
+    expect(result.agentId).toBe("agent-1");
+    expect(client.callCalls).toEqual([
+      { method: "agent.spawn", params: { prompt: "hi", cwd: "/tmp" } },
+    ]);
+  });
+
+  it("call throws for an unknown or disconnected host", async () => {
+    const { manager } = createManager();
+    await expect(manager.call("ghost", "team.list", {})).rejects.toThrow(
+      "not connected to host: ghost",
+    );
   });
 
   it("throws when operating on an unknown or disconnected host", async () => {

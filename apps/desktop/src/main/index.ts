@@ -1,11 +1,14 @@
 import path from "node:path";
 
+import { METHODS } from "@crow/protocol";
 import { app, BrowserWindow, ipcMain, Menu, Notification } from "electron";
 
 import type {
+  AgentSpawnRequest,
   ApprovalRespondRequest,
   CreateSessionRequest,
   SendPromptRequest,
+  TeamRunRequest,
 } from "../shared/api.ts";
 import type { KnownHost } from "../shared/hosts.ts";
 import { ConnectionManager } from "./connection-manager.ts";
@@ -101,6 +104,32 @@ function registerIpc(): void {
   ipcMain.handle("approval:respond", (_event, params: ApprovalRespondRequest) =>
     manager.respondApproval(params.hostName, params.approvalId, params.decision),
   );
+
+  ipcMain.handle("agent:spawn", (_event, params: AgentSpawnRequest) => {
+    const { hostName, ...rest } = params;
+    return manager.call(hostName, METHODS.AGENT_SPAWN, {
+      ...rest,
+      cwd: expandHomeForHost(hostName, params.cwd),
+    });
+  });
+
+  ipcMain.handle("team:list", (_event, hostName: string) =>
+    manager.call(hostName, METHODS.TEAM_LIST, {}),
+  );
+
+  ipcMain.handle("team:run", (_event, params: TeamRunRequest) => {
+    const { hostName, ...rest } = params;
+    return manager.call(hostName, METHODS.TEAM_RUN, {
+      ...rest,
+      cwd: expandHomeForHost(hostName, params.cwd),
+    });
+  });
+}
+
+/** Expand "~" against the local home dir, but only for loopback daemons. */
+function expandHomeForHost(hostName: string, cwd: string): string {
+  const conn = manager.get(hostName);
+  return conn ? expandHome(cwd, conn.host.url) : cwd;
 }
 
 async function createWindow(): Promise<void> {

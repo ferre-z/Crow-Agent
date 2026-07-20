@@ -27,6 +27,9 @@ const bridge: CrowBridge = {
   sessionList: (hostName) => ipcRenderer.invoke("session:list", hostName),
   sessionAttach: (params) => ipcRenderer.invoke("session:attach", params),
   approvalRespond: (params) => ipcRenderer.invoke("approval:respond", params),
+  agentSpawn: (params) => ipcRenderer.invoke("agent:spawn", params),
+  teamList: (hostName) => ipcRenderer.invoke("team:list", hostName),
+  teamRun: (params) => ipcRenderer.invoke("team:run", params),
   onDaemonEvent: (listener) => subscribe("daemon:event", listener),
   onDaemonState: (listener) => subscribe("daemon:state", listener),
 };

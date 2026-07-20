@@ -3,16 +3,24 @@ import { useEffect, useMemo, useState } from "react";
 import type { ScreenProps } from "./App.tsx";
 import ApprovalModal from "./ApprovalModal.tsx";
 import ChatView from "./ChatView.tsx";
+import TeamRunModal from "./TeamRunModal.tsx";
+import TeamRunView from "./TeamRunView.tsx";
 import { connectHost } from "./connect-host.ts";
 import {
+  makeRunKey,
   makeSessionKey,
   selectActiveSession,
+  selectActiveTeamRun,
+  selectAgentRuns,
   selectConnectedHosts,
   selectCurrentApproval,
   selectSessions,
+  selectTeamRuns,
   sessionDisplayName,
+  type AgentRun,
   type LiveSessionState,
   type SessionEntry,
+  type TeamRun,
 } from "./state.ts";
 
 const DOT_CLASS: Record<LiveSessionState, string> = {
@@ -21,6 +29,83 @@ const DOT_CLASS: Record<LiveSessionState, string> = {
   error: "bg-danger",
   cancelled: "bg-warn",
 };
+
+const AGENT_DOT_CLASS: Record<AgentRun["state"], string> = {
+  started: "bg-crow animate-pulse",
+  done: "bg-crow",
+  error: "bg-danger",
+};
+
+const TEAM_DOT_CLASS: Record<TeamRun["state"], string> = {
+  running: "bg-crow animate-pulse",
+  done: "bg-crow",
+  error: "bg-danger",
+};
+
+function AgentRunRow({ run }: { run: AgentRun }) {
+  const [expanded, setExpanded] = useState(false);
+  const body = run.state === "error" ? run.error : run.output;
+  return (
+    <div>
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-ink-2"
+      >
+        <span
+          className={`h-2 w-2 shrink-0 rounded-full ${AGENT_DOT_CLASS[run.state]}`}
+          title={run.state}
+        />
+        <span className="min-w-0 flex-1 truncate">{run.prompt}</span>
+        <span
+          className={`shrink-0 text-[10px] ${run.state === "error" ? "text-danger" : "text-fg-dim"}`}
+        >
+          {run.state}
+        </span>
+      </button>
+      {expanded && body ? (
+        <pre
+          className={`mx-2 mb-1 max-h-40 overflow-auto rounded border border-line bg-ink px-2 py-1 text-[11px] whitespace-pre-wrap ${
+            run.state === "error" ? "text-danger" : "text-fg"
+          }`}
+        >
+          {body}
+        </pre>
+      ) : null}
+    </div>
+  );
+}
+
+function TeamRunRow({
+  run,
+  active,
+  onSelect,
+}: {
+  run: TeamRun;
+  active: boolean;
+  onSelect: (hostName: string, runId: string) => void;
+}) {
+  return (
+    <button
+      onClick={() => onSelect(run.hostName, run.runId)}
+      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-ink-2 ${
+        active ? "bg-ink-2 text-crow" : ""
+      }`}
+    >
+      <span
+        className={`h-2 w-2 shrink-0 rounded-full ${TEAM_DOT_CLASS[run.state]}`}
+        title={run.state}
+      />
+      <span className="min-w-0 flex-1 truncate">
+        {run.hostName}: {run.team}
+      </span>
+      <span
+        className={`shrink-0 text-[10px] ${run.state === "error" ? "text-danger" : "text-fg-dim"}`}
+      >
+        {run.state}
+      </span>
+    </button>
+  );
+}
 
 function SessionRow({
   session,
@@ -58,11 +143,15 @@ export default function MainScreen({
   const disconnectedHosts = allHosts.filter((h) => h.state !== "connected");
   const sessions = selectSessions(state);
   const active = selectActiveSession(state);
+  const activeTeamRun = selectActiveTeamRun(state);
+  const teamRuns = selectTeamRuns(state);
+  const agentRuns = selectAgentRuns(state);
   const currentApproval = selectCurrentApproval(state);
 
   const [cwd, setCwd] = useState("~");
   const [approvalMode, setApprovalMode] = useState<"auto" | "ask">("ask");
   const [autoApproveTools, setAutoApproveTools] = useState("");
+  const [showTeamModal, setShowTeamModal] = useState(false);
   const [selectedHost, setSelectedHost] = useState<string>(connectedHosts[0]?.host.name ?? "");
 
   // Keep the selected host valid if the fleet changes.
@@ -106,6 +195,10 @@ export default function MainScreen({
     void window.crow.sessionAttach({ hostName, sessionId }).catch(() => undefined);
   }
 
+  function handleSelectTeamRun(hostName: string, runId: string) {
+    dispatch({ type: "team.selected", hostName, runId });
+  }
+
   const sessionsByHost = useMemo(() => {
     const map = new Map<string, SessionEntry[]>();
     for (const host of connectedHosts) {
@@ -124,12 +217,21 @@ export default function MainScreen({
         <div className="border-b border-line p-3">
           <div className="flex items-center justify-between">
             <span className="text-sm font-semibold text-crow">crow</span>
-            <button
-              onClick={onManageHosts}
-              className="rounded border border-line px-2 py-0.5 text-xs text-fg-dim hover:text-crow"
-            >
-              hosts ({connectedHosts.length}/{allHosts.length})
-            </button>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setShowTeamModal(true)}
+                disabled={connectedHosts.length === 0}
+                className="rounded border border-line px-2 py-0.5 text-xs text-fg-dim hover:text-crow disabled:opacity-50"
+              >
+                run team
+              </button>
+              <button
+                onClick={onManageHosts}
+                className="rounded border border-line px-2 py-0.5 text-xs text-fg-dim hover:text-crow"
+              >
+                hosts ({connectedHosts.length}/{allHosts.length})
+              </button>
+            </div>
           </div>
         </div>
 
@@ -234,8 +336,9 @@ export default function MainScreen({
                             <SessionRow
                               session={session}
                               active={
+                                state.activeView?.kind === "session" &&
                                 makeSessionKey(session.hostName, session.info.id) ===
-                                state.activeSessionKey
+                                  state.activeView.key
                               }
                               onSelect={handleSelect}
                             />
@@ -249,17 +352,50 @@ export default function MainScreen({
             </div>
           )}
         </div>
+
+        {teamRuns.length > 0 || agentRuns.length > 0 ? (
+          <div className="max-h-64 shrink-0 overflow-y-auto border-t border-line p-2">
+            <div className="mb-1 px-1 text-xs font-semibold uppercase tracking-wide text-fg-dim">
+              runs
+            </div>
+            <ul className="space-y-0.5">
+              {teamRuns.map((run) => (
+                <li key={makeRunKey(run.hostName, run.runId)}>
+                  <TeamRunRow
+                    run={run}
+                    active={
+                      state.activeView?.kind === "team" &&
+                      state.activeView.runId === makeRunKey(run.hostName, run.runId)
+                    }
+                    onSelect={handleSelectTeamRun}
+                  />
+                </li>
+              ))}
+              {agentRuns.map((run) => (
+                <li key={makeRunKey(run.hostName, run.agentId)}>
+                  <AgentRunRow run={run} />
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col">
-        {active ? (
+        {activeTeamRun ? (
+          <TeamRunView run={activeTeamRun} />
+        ) : active ? (
           <ChatView session={active} dispatch={dispatch} />
         ) : (
           <div className="flex flex-1 items-center justify-center text-sm text-fg-dim">
-            Select a session, or create a new one.
+            Select a session or a run, or create a new one.
           </div>
         )}
       </main>
+
+      {showTeamModal ? (
+        <TeamRunModal state={state} dispatch={dispatch} onClose={() => setShowTeamModal(false)} />
+      ) : null}
 
       {currentApproval ? <ApprovalModal approval={currentApproval} dispatch={dispatch} /> : null}
     </div>

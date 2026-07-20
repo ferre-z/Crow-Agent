@@ -152,6 +152,11 @@ export class ConnectionManager {
     this.require(hostName).client.respondApproval(approvalId, decision);
   }
 
+  /** Generic JSON-RPC passthrough for methods without a dedicated CrowClient wrapper. */
+  async call<T = unknown>(hostName: string, method: string, params?: unknown): Promise<T> {
+    return this.require(hostName).client.call<T>(method, params);
+  }
+
   private require(hostName: string): Connection {
     const conn = this.connections.get(hostName);
     if (!conn || conn.state !== "connected") {

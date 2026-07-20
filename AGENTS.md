@@ -25,9 +25,10 @@ Crow ships three runtime pieces:
 
 Development is phase-planned (see `docs/architecture.md`): P0 scaffold → P1
 core+daemon → P2 desktop + `@crow/client` + approvals → P3 multihost fleet +
-CLI are committed. Next up: P4 sub-agents/teams, P5 A2A daemon-to-daemon, P6
-workflows+cron, P7 memory, P8 distribution. The README's `skills/` and
-`scripts/` directories are planned (P8) and do not exist yet.
+CLI are committed, as is the P4 backend (sub-agents `agent.spawn` and teams
+`team.list`/`team.run` in `@crow/core` + `@crow/daemon`). Next up: P5 A2A
+daemon-to-daemon, P6 workflows+cron, P7 memory, P8 distribution. The README's
+`skills/` and `scripts/` directories are planned (P8) and do not exist yet.
 
 ## Project Structure & Module Organization
 

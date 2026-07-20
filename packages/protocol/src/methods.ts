@@ -2,8 +2,8 @@ import { z } from "zod";
 
 /**
  * Crow daemon methods (client → daemon). P1 set: sessions + host info.
- * Later phases add agent.spawn / team.run (P4), workflow.* / cron.* (P6),
- * memory.* (P7).
+ * P4 adds sub-agents (agent.spawn) and teams (team.list / team.run).
+ * Later phases add workflow.* / cron.* (P6), memory.* (P7).
  */
 export const METHODS = {
   SESSION_CREATE: "session.create",
@@ -12,6 +12,9 @@ export const METHODS = {
   SESSION_LIST: "session.list",
   SESSION_ATTACH: "session.attach",
   HOST_INFO: "host.info",
+  AGENT_SPAWN: "agent.spawn",
+  TEAM_LIST: "team.list",
+  TEAM_RUN: "team.run",
 } as const;
 
 /** Model reference as "provider/modelId" (e.g. "anthropic/claude-sonnet-4-5"). */
@@ -94,6 +97,66 @@ export const hostInfoResultSchema = z.object({
 });
 export type HostInfoResult = z.infer<typeof hostInfoResultSchema>;
 
+// --- agent.spawn (P4) ---
+
+/**
+ * Spawn an independent sub-agent run. Returns immediately; completion arrives
+ * as an `event.agent` notification broadcast to every connected client.
+ * `tools` whitelists names from the default coding set (read/write/edit/bash);
+ * absent means the full set.
+ */
+export const agentSpawnParamsSchema = z.object({
+  prompt: z.string().min(1),
+  cwd: z.string().min(1),
+  systemPrompt: z.string().optional(),
+  tools: z.array(z.string()).optional(),
+  model: modelRefSchema.optional(),
+});
+export type AgentSpawnParams = z.infer<typeof agentSpawnParamsSchema>;
+
+export const agentSpawnResultSchema = z.object({
+  agentId: z.string(),
+});
+export type AgentSpawnResult = z.infer<typeof agentSpawnResultSchema>;
+
+// --- team.list (P4) ---
+export const teamAgentInfoSchema = z.object({
+  name: z.string(),
+  role: z.string(),
+});
+export type TeamAgentInfo = z.infer<typeof teamAgentInfoSchema>;
+
+export const teamInfoSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  agents: z.array(teamAgentInfoSchema),
+});
+export type TeamInfo = z.infer<typeof teamInfoSchema>;
+
+export const teamListResultSchema = z.object({
+  teams: z.array(teamInfoSchema),
+});
+export type TeamListResult = z.infer<typeof teamListResultSchema>;
+
+// --- team.run (P4) ---
+
+/**
+ * Run a named team preset against `input`. Returns immediately; progress
+ * arrives as `event.team` notifications broadcast to every connected client.
+ */
+export const teamRunParamsSchema = z.object({
+  team: z.string().min(1),
+  input: z.string().min(1),
+  cwd: z.string().min(1),
+  model: modelRefSchema.optional(),
+});
+export type TeamRunParams = z.infer<typeof teamRunParamsSchema>;
+
+export const teamRunResultSchema = z.object({
+  runId: z.string(),
+});
+export type TeamRunResult = z.infer<typeof teamRunResultSchema>;
+
 /** Params validator per method, for dispatch. */
 export const methodParamsSchemas = {
   [METHODS.SESSION_CREATE]: sessionCreateParamsSchema,
@@ -102,6 +165,9 @@ export const methodParamsSchemas = {
   [METHODS.SESSION_LIST]: z.object({}).strict(),
   [METHODS.SESSION_ATTACH]: sessionAttachParamsSchema,
   [METHODS.HOST_INFO]: z.object({}).strict(),
+  [METHODS.AGENT_SPAWN]: agentSpawnParamsSchema,
+  [METHODS.TEAM_LIST]: z.object({}).strict(),
+  [METHODS.TEAM_RUN]: teamRunParamsSchema,
 } as const;
 
 // --- approval.respond (client → daemon notification, no id, no response) ---

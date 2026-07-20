@@ -6,6 +6,9 @@ import {
   CrowSessionManager,
   createCrowModels,
   DEFAULT_MODEL_REF,
+  SubAgentRunner,
+  TEAM_PRESETS,
+  TeamRunner,
   type ApprovalDecision,
   type ApprovalRequest,
   type ApprovalVerdict,
@@ -27,6 +30,7 @@ import {
   NOTIFICATIONS,
   PROTOCOL_VERSION,
   RPC_ERRORS,
+  type AgentSpawnParams,
   type ApprovalRespondParams,
   type HostInfoResult,
   type JsonRpcFrame,
@@ -38,6 +42,8 @@ import {
   type SessionCreateParams,
   type SessionInfo,
   type SessionSendParams,
+  type TeamListResult,
+  type TeamRunParams,
 } from "@crow/protocol";
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -99,6 +105,8 @@ function toWireSessionInfo(info: CrowSessionInfo): SessionInfo {
 export class CrowDaemon {
   private readonly options: CrowDaemonOptions;
   private readonly manager: CrowSessionManager;
+  private readonly subAgents: SubAgentRunner;
+  private readonly teams: TeamRunner;
   private readonly connections = new Set<ConnectionState>();
   private readonly sessionSubscriptions = new Map<string, () => void>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
@@ -106,11 +114,19 @@ export class CrowDaemon {
 
   constructor(options: CrowDaemonOptions) {
     this.options = options;
+    const models = options.models ?? createCrowModels();
+    const defaultModelRef = options.defaultModelRef ?? DEFAULT_MODEL_REF;
     this.manager = new CrowSessionManager({
       sessionsRoot: path.join(options.dataDir, "sessions"),
-      models: options.models ?? createCrowModels(),
-      defaultModelRef: options.defaultModelRef ?? DEFAULT_MODEL_REF,
+      models,
+      defaultModelRef,
     });
+    this.subAgents = new SubAgentRunner({
+      sessionsRoot: path.join(options.dataDir, "subagent-sessions"),
+      models,
+      defaultModelRef,
+    });
+    this.teams = new TeamRunner(this.subAgents);
   }
 
   start(): Promise<{ port: number }> {
@@ -153,6 +169,10 @@ export class CrowDaemon {
       this.pendingApprovals.delete(approvalId);
     }
     await this.manager.shutdown();
+    // In-flight sub-agent/team runs are aborted here: their `done` promises
+    // reject as "aborted", and the resulting error events are no-ops because
+    // the connections above are already closed (broadcastAll skips them).
+    await this.subAgents.shutdown();
     await new Promise<void>((resolve) => {
       if (!this.wss) {
         resolve();
@@ -292,11 +312,13 @@ export class CrowDaemon {
       this.sendFrame(conn, makeResult(id, result ?? {}));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const code = message.includes("not found")
-        ? RPC_ERRORS.SESSION_NOT_FOUND
-        : message.includes("busy")
-          ? RPC_ERRORS.SESSION_BUSY
-          : RPC_ERRORS.INTERNAL_ERROR;
+      const code = message.startsWith("unknown team:")
+        ? RPC_ERRORS.INVALID_PARAMS
+        : message.includes("not found")
+          ? RPC_ERRORS.SESSION_NOT_FOUND
+          : message.includes("busy")
+            ? RPC_ERRORS.SESSION_BUSY
+            : RPC_ERRORS.INTERNAL_ERROR;
       this.sendFrame(conn, makeError(id, code, message));
     }
   }
@@ -365,6 +387,64 @@ export class CrowDaemon {
         };
         return result;
       }
+      case METHODS.AGENT_SPAWN: {
+        const p = params as AgentSpawnParams;
+        const { agentId, done } = await this.subAgents.spawn({
+          prompt: p.prompt,
+          cwd: p.cwd,
+          ...(p.systemPrompt !== undefined ? { systemPrompt: p.systemPrompt } : {}),
+          ...(p.tools !== undefined ? { tools: p.tools } : {}),
+          ...(p.model !== undefined ? { model: p.model } : {}),
+        });
+        // Sub-agent events go to every connected client, not just the spawner.
+        this.broadcastAll(makeNotification(EVENTS.AGENT, { agentId, state: "started" }));
+        done.then(
+          ({ output }) =>
+            this.broadcastAll(makeNotification(EVENTS.AGENT, { agentId, state: "done", output })),
+          (error: unknown) =>
+            this.broadcastAll(
+              makeNotification(EVENTS.AGENT, {
+                agentId,
+                state: "error",
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            ),
+        );
+        return { agentId };
+      }
+      case METHODS.TEAM_LIST: {
+        const result: TeamListResult = {
+          teams: TEAM_PRESETS.map((preset) => ({
+            name: preset.name,
+            description: preset.description,
+            agents: preset.agents.map((agent) => ({ name: agent.name, role: agent.role })),
+          })),
+        };
+        return result;
+      }
+      case METHODS.TEAM_RUN: {
+        const p = params as TeamRunParams;
+        // Validate before returning a runId: an unknown team is an RPC error
+        // (INVALID_PARAMS), not an event.team error.
+        if (!this.teams.getPreset(p.team)) {
+          throw new Error(`unknown team: ${p.team}`);
+        }
+        const runId = `run_${randomUUID()}`;
+        const run = this.teams.run(
+          p.team,
+          p.input,
+          { cwd: p.cwd, ...(p.model !== undefined ? { model: p.model } : {}) },
+          (event) => this.broadcastAll(makeNotification(EVENTS.TEAM, { runId, ...event })),
+        );
+        run.then(
+          ({ output }) =>
+            this.broadcastAll(makeNotification(EVENTS.TEAM, { runId, state: "done", output })),
+          () => {
+            // The failing step already broadcast its event.team error.
+          },
+        );
+        return { runId };
+      }
       default:
         // Unreachable: paramsValidators gates unknown methods first.
         throw new Error(`unhandled method: ${method}`);
@@ -393,6 +473,19 @@ export class CrowDaemon {
     const frame = encodeFrame(notification);
     for (const conn of this.connections) {
       if (!conn.attachedSessionIds.has(sessionId)) continue;
+      if (conn.ws.readyState === WebSocket.OPEN) {
+        conn.ws.send(frame);
+      }
+    }
+  }
+
+  /**
+   * Fan a notification out to every connected client. Used by the P4
+   * agent/team events, which are global rather than session-scoped.
+   */
+  private broadcastAll(notification: JsonRpcNotification): void {
+    const frame = encodeFrame(notification);
+    for (const conn of this.connections) {
       if (conn.ws.readyState === WebSocket.OPEN) {
         conn.ws.send(frame);
       }

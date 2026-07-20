@@ -10,17 +10,22 @@ import {
 } from "./jsonrpc.ts";
 import {
   approvalRespondParamsSchema,
+  agentSpawnParamsSchema,
   METHODS,
   methodParamsSchemas,
   NOTIFICATIONS,
   sessionCreateParamsSchema,
   sessionInfoSchema,
+  teamListResultSchema,
+  teamRunParamsSchema,
 } from "./methods.ts";
 import {
+  agentEventSchema,
   approvalRequestEventSchema,
   EVENTS,
   eventParamsSchemas,
   sessionStateEventSchema,
+  teamEventSchema,
 } from "./events.ts";
 
 describe("jsonrpc framing", () => {
@@ -96,6 +101,51 @@ describe("method params", () => {
       expect(methodParamsSchemas[method]).toBeDefined();
     }
   });
+
+  it("validates agent.spawn params (P4)", () => {
+    const parsed = agentSpawnParamsSchema.parse({
+      prompt: "fix the tests",
+      cwd: "/work",
+      systemPrompt: "You are careful.",
+      tools: ["read", "edit"],
+      model: "nvidia/some-model",
+    });
+    expect(parsed.tools).toEqual(["read", "edit"]);
+
+    // Only prompt + cwd are required; absent tools means the full set.
+    const bare = agentSpawnParamsSchema.parse({ prompt: "hi", cwd: "/work" });
+    expect(bare.systemPrompt).toBeUndefined();
+    expect(bare.tools).toBeUndefined();
+    expect(bare.model).toBeUndefined();
+
+    expect(() => agentSpawnParamsSchema.parse({ prompt: "", cwd: "/work" })).toThrow();
+    expect(() => agentSpawnParamsSchema.parse({ prompt: "hi" })).toThrow();
+    expect(() =>
+      agentSpawnParamsSchema.parse({ prompt: "hi", cwd: "/work", model: "noslash" }),
+    ).toThrow();
+  });
+
+  it("validates team.run params and the team.list result shape (P4)", () => {
+    const parsed = teamRunParamsSchema.parse({
+      team: "solo-review",
+      input: "review this",
+      cwd: "/w",
+    });
+    expect(parsed.model).toBeUndefined();
+    expect(() => teamRunParamsSchema.parse({ team: "x", input: "y" })).toThrow();
+    expect(() => teamRunParamsSchema.parse({ team: "", input: "y", cwd: "/w" })).toThrow();
+
+    const listed = teamListResultSchema.parse({
+      teams: [
+        {
+          name: "solo-review",
+          description: "one reviewer",
+          agents: [{ name: "reviewer", role: "Reviews the input" }],
+        },
+      ],
+    });
+    expect(listed.teams[0]?.agents[0]?.name).toBe("reviewer");
+  });
 });
 
 describe("notifications", () => {
@@ -146,5 +196,49 @@ describe("events", () => {
   it("accepts every event notification frame", () => {
     const n = makeNotification(EVENTS.TOKEN, { sessionId: "s1", text: "hi" });
     expect(decodeFrame(encodeFrame(n).trimEnd())).toEqual(n);
+  });
+
+  it("validates agent lifecycle events (P4)", () => {
+    expect(agentEventSchema.parse({ agentId: "agent_1", state: "started" })).toEqual({
+      agentId: "agent_1",
+      state: "started",
+    });
+    expect(
+      agentEventSchema.parse({ agentId: "agent_1", state: "done", output: "result text" }),
+    ).toEqual({ agentId: "agent_1", state: "done", output: "result text" });
+    expect(agentEventSchema.parse({ agentId: "agent_1", state: "error", error: "boom" })).toEqual({
+      agentId: "agent_1",
+      state: "error",
+      error: "boom",
+    });
+    expect(() => agentEventSchema.parse({ agentId: "agent_1", state: "running" })).toThrow();
+  });
+
+  it("validates team progress events (P4)", () => {
+    const step = teamEventSchema.parse({
+      runId: "run_1",
+      state: "step_done",
+      step: 2,
+      agent: "implementer",
+      output: "patched",
+    });
+    expect(step.step).toBe(2);
+    expect(teamEventSchema.parse({ runId: "run_1", state: "done", output: "verdict" })).toEqual({
+      runId: "run_1",
+      state: "done",
+      output: "verdict",
+    });
+    expect(
+      teamEventSchema.parse({
+        runId: "run_1",
+        state: "error",
+        step: 1,
+        agent: "planner",
+        error: "x",
+      }),
+    ).toEqual({ runId: "run_1", state: "error", step: 1, agent: "planner", error: "x" });
+    // Steps are 1-based: 0 and unknown states are rejected.
+    expect(() => teamEventSchema.parse({ runId: "r", state: "step_done", step: 0 })).toThrow();
+    expect(() => teamEventSchema.parse({ runId: "r", state: "stepping" })).toThrow();
   });
 });
