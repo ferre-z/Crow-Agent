@@ -78,13 +78,13 @@ to configure the desktop app / CLI.
 ## Run the desktop app
 
 ```bash
-# Make sure the Electron binary is downloaded first.
-# If `pnpm dev` complains about a missing binary:
-node apps/desktop/node_modules/electron/install.js
-
 pnpm --filter @crow/daemon start   # terminal 1
 pnpm --filter @crow/desktop dev    # terminal 2
 ```
+
+The Electron binary downloads automatically during `pnpm install` (workspace
+`postinstall`). If it's ever missing (e.g. you installed with scripts
+disabled), run `node apps/desktop/node_modules/electron/install.js` once.
 
 Then in the desktop app add one or more hosts (e.g. `ws://127.0.0.1:7749`) with
 the token from `~/.crow/daemon.json`. The fleet sidebar supports multiple
