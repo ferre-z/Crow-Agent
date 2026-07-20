@@ -6,6 +6,13 @@
     "node": ">=20"
   },
   "packageManager": "pnpm@9.15.0",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "better-sqlite3",
+      "esbuild"
+    ]
+  },
   "scripts": {
     "build": "pnpm -r run build",
     "test": "pnpm -r run test",
