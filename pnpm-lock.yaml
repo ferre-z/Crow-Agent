@@ -138,6 +138,9 @@ importers:
       '@crow/core':
         specifier: workspace:^
         version: link:../core
+      '@crow/memory':
+        specifier: workspace:^
+        version: link:../memory
       '@crow/protocol':
         specifier: workspace:^
         version: link:../protocol

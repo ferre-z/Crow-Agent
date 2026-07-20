@@ -960,4 +960,30 @@ describe("CrowDaemon", () => {
       ).rejects.toMatchObject({ code: RPC_ERRORS.INVALID_PARAMS });
     });
   });
+
+  describe("memory (P7)", () => {
+    it("writes facts, queries them, and lists episodes/facts", async () => {
+      const client = await openClient();
+      const wrote = (await client.call(METHODS.MEMORY_WRITE, {
+        text: "Crow is NVIDIA-first",
+        tags: ["preference"],
+      })) as { id: string };
+      expect(wrote.id).toMatch(/^fact_/);
+
+      const queried = (await client.call(METHODS.MEMORY_QUERY, { q: "NVIDIA" })) as {
+        results: { id: string; kind: string; text: string }[];
+      };
+      expect(queried.results.some((r) => r.id === wrote.id)).toBe(true);
+
+      const facts = (await client.call(METHODS.MEMORY_FACTS, {})) as {
+        facts: { id: string }[];
+      };
+      expect(facts.facts.find((f) => f.id === wrote.id)).toBeDefined();
+
+      const episodes = (await client.call(METHODS.MEMORY_EPISODES, {})) as {
+        episodes: unknown[];
+      };
+      expect(Array.isArray(episodes.episodes)).toBe(true);
+    });
+  });
 });

@@ -49,6 +49,8 @@ const TOOL_OUTPUT_MAX_CHARS = 4000;
 const DEFAULT_BASE_PROMPT =
   "You are Crow, an autonomous coding agent running inside the crow daemon.";
 
+export { DEFAULT_BASE_PROMPT };
+
 export class CrowSession {
   readonly id: string;
   readonly cwd: string;

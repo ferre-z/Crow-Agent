@@ -37,6 +37,7 @@ export { buildSystemPrompt, loadCrowSkills } from "./skills.ts";
 export {
   CrowSession,
   CrowSessionManager,
+  DEFAULT_BASE_PROMPT,
   buildSessionHarness,
   type BuildSessionHarnessOptions,
   type BuiltSessionHarness,

@@ -4,10 +4,13 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
+import { MemoryStore } from "@crow/memory";
+
 import {
   CrowSessionManager,
   createCrowModels,
   CronScheduler,
+  DEFAULT_BASE_PROMPT,
   DEFAULT_MODEL_REF,
   isWorkflow,
   SubAgentRunner,
@@ -56,6 +59,15 @@ import {
   type SessionSendParams,
   type TeamListResult,
   type TeamRunParams,
+  type MemoryEpisodeWire,
+  type MemoryEpisodesResult,
+  type MemoryFactWire,
+  type MemoryFactsResult,
+  type MemoryHitWire,
+  type MemoryQueryParams,
+  type MemoryQueryResult,
+  type MemoryWriteParams,
+  type MemoryWriteResult,
   type WorkflowInfo,
   type WorkflowListResult,
   type WorkflowRunParams,
@@ -133,6 +145,7 @@ export class CrowDaemon {
   private readonly teams: TeamRunner;
   private readonly workflows: Map<string, Workflow>;
   private readonly scheduler: CronScheduler;
+  private readonly memory: MemoryStore;
   private readonly connections = new Set<ConnectionState>();
   private readonly sessionSubscriptions = new Map<string, () => void>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
@@ -159,6 +172,7 @@ export class CrowDaemon {
     this.scheduler = new CronScheduler(path.join(options.dataDir, "scheduler.db"));
     this.scheduler.setFireCallback((job) => void this.fireCronJob(job));
     this.scheduler.start();
+    this.memory = new MemoryStore({ dbPath: path.join(options.dataDir, "memory.db") });
   }
 
   private workflowsForRun(name: string): Workflow {
@@ -324,6 +338,7 @@ export class CrowDaemon {
     // the connections above are already closed (broadcastAll skips them).
     await this.subAgents.shutdown();
     this.scheduler.close();
+    this.memory.close();
     if (this.a2aServer) {
       await this.a2aServer.stop();
       this.a2aServer = undefined;
@@ -479,10 +494,16 @@ export class CrowDaemon {
         // The gate's ask callback only fires once the session is prompting,
         // so closing over `sessionId` before it is assigned below is safe.
         let sessionId = "";
+        const memoryBlock = this.memory.contextBlock(`session cwd ${p.cwd}`);
+        const composedSystemPrompt = p.systemPrompt
+          ? p.systemPrompt
+          : memoryBlock
+            ? `${DEFAULT_BASE_PROMPT}\n\n${memoryBlock}`
+            : undefined;
         const session = await this.manager.create({
           cwd: p.cwd,
           modelRef: p.model,
-          systemPrompt: p.systemPrompt,
+          ...(composedSystemPrompt !== undefined ? { systemPrompt: composedSystemPrompt } : {}),
           skillDirs: p.skillDirs,
           approvalMode: p.approvalMode,
           autoApproveTools: p.autoApproveTools,
@@ -661,6 +682,42 @@ export class CrowDaemon {
         }
         return {};
       }
+      case METHODS.MEMORY_QUERY: {
+        const p = params as MemoryQueryParams;
+        const hits = this.memory.query({
+          q: p.q,
+          ...(p.k !== undefined ? { k: p.k } : {}),
+          ...(p.kinds !== undefined ? { kinds: p.kinds } : {}),
+        });
+        const result: MemoryQueryResult = { results: hits.map(memoryHitToWire) };
+        return result;
+      }
+      case METHODS.MEMORY_WRITE: {
+        const p = params as MemoryWriteParams;
+        const fact = this.memory.addFact({
+          text: p.text,
+          ...(p.tags !== undefined ? { tags: p.tags } : {}),
+        });
+        const result: MemoryWriteResult = {
+          id: fact.id,
+          text: fact.text,
+          tags: fact.tags,
+          createdAt: fact.createdAt,
+        };
+        return result;
+      }
+      case METHODS.MEMORY_EPISODES: {
+        const result: MemoryEpisodesResult = {
+          episodes: this.memory.listEpisodes().map(memoryEpisodeToWire),
+        };
+        return result;
+      }
+      case METHODS.MEMORY_FACTS: {
+        const result: MemoryFactsResult = {
+          facts: this.memory.listFacts().map(memoryFactToWire),
+        };
+        return result;
+      }
       default:
         // Unreachable: paramsValidators gates unknown methods first.
         throw new Error(`unhandled method: ${method}`);
@@ -678,8 +735,24 @@ export class CrowDaemon {
   /** One crow-listener per session, fanning events out to every attached connection. */
   private ensureSessionSubscription(session: CrowSession): void {
     if (this.sessionSubscriptions.has(session.id)) return;
+    let lastText = "";
     const unsubscribe = session.subscribe((event) => {
       this.broadcastSessionEvent(session.id, event);
+      if (event.type === "token") lastText += event.text;
+      if (event.type === "state" && (event.state === "idle" || event.state === "error")) {
+        // Persist the final assistant text as an episode for future sessions.
+        const text = lastText || session.getInfo().modelRef;
+        try {
+          this.memory.addEpisode({
+            sessionId: session.id,
+            host: os.hostname(),
+            text,
+            tags: [session.getInfo().approvalMode],
+          });
+        } catch {
+          // Memory write failures must not break session flow.
+        }
+      }
     });
     this.sessionSubscriptions.set(session.id, unsubscribe);
   }
@@ -788,6 +861,60 @@ function cronJobToWire(job: {
     ...(job.lastRunAt ? { lastRunAt: job.lastRunAt } : {}),
     nextRunAt: job.nextRunAt,
     enabled: job.enabled,
+  };
+}
+
+function memoryHitToWire(hit: {
+  id: string;
+  kind: "episode" | "fact";
+  text: string;
+  score: number;
+  tags: string[];
+  createdAt: string;
+  sessionId?: string;
+  host?: string;
+}): MemoryHitWire {
+  return {
+    id: hit.id,
+    kind: hit.kind,
+    text: hit.text,
+    score: hit.score,
+    tags: hit.tags,
+    createdAt: hit.createdAt,
+    ...(hit.sessionId ? { sessionId: hit.sessionId } : {}),
+    ...(hit.host ? { host: hit.host } : {}),
+  };
+}
+
+function memoryEpisodeToWire(episode: {
+  id: string;
+  sessionId?: string;
+  host?: string;
+  text: string;
+  tags: string[];
+  createdAt: string;
+}): MemoryEpisodeWire {
+  return {
+    id: episode.id,
+    ...(episode.sessionId ? { sessionId: episode.sessionId } : {}),
+    ...(episode.host ? { host: episode.host } : {}),
+    text: episode.text,
+    tags: episode.tags,
+    createdAt: episode.createdAt,
+  };
+}
+
+function memoryFactToWire(fact: {
+  id: string;
+  text: string;
+  tags: string[];
+  createdAt: string;
+}): MemoryFactWire {
+  return {
+    id: fact.id,
+    text: fact.text,
+    tags: fact.tags,
+    createdAt: fact.createdAt,
   };
 }
 

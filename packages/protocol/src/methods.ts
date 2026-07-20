@@ -20,6 +20,10 @@ export const METHODS = {
   CRON_ADD: "cron.add",
   CRON_LIST: "cron.list",
   CRON_REMOVE: "cron.remove",
+  MEMORY_QUERY: "memory.query",
+  MEMORY_WRITE: "memory.write",
+  MEMORY_EPISODES: "memory.episodes",
+  MEMORY_FACTS: "memory.facts",
 } as const;
 
 /** Model reference as "provider/modelId" (e.g. "anthropic/claude-sonnet-4-5"). */
@@ -239,6 +243,68 @@ export const cronRemoveParamsSchema = z.object({
 });
 export type CronRemoveParams = z.infer<typeof cronRemoveParamsSchema>;
 
+// --- memory.query / memory.write / memory.episodes / memory.facts (P7) ---
+
+export const memoryQueryParamsSchema = z.object({
+  q: z.string().min(1),
+  k: z.number().int().min(1).max(50).optional(),
+  kinds: z.array(z.enum(["episode", "fact"])).optional(),
+});
+export type MemoryQueryParams = z.infer<typeof memoryQueryParamsSchema>;
+
+export const memoryHitSchema = z.object({
+  id: z.string(),
+  kind: z.enum(["episode", "fact"]),
+  text: z.string(),
+  score: z.number(),
+  tags: z.array(z.string()),
+  createdAt: z.string(),
+  sessionId: z.string().optional(),
+  host: z.string().optional(),
+});
+export type MemoryHitWire = z.infer<typeof memoryHitSchema>;
+
+export const memoryQueryResultSchema = z.object({ results: z.array(memoryHitSchema) });
+export type MemoryQueryResult = z.infer<typeof memoryQueryResultSchema>;
+
+export const memoryWriteParamsSchema = z.object({
+  text: z.string().min(1),
+  tags: z.array(z.string()).optional(),
+});
+export type MemoryWriteParams = z.infer<typeof memoryWriteParamsSchema>;
+
+export const memoryWriteResultSchema = z.object({
+  id: z.string(),
+  text: z.string(),
+  tags: z.array(z.string()),
+  createdAt: z.string(),
+});
+export type MemoryWriteResult = z.infer<typeof memoryWriteResultSchema>;
+
+export const memoryEpisodeSchema = z.object({
+  id: z.string(),
+  sessionId: z.string().optional(),
+  host: z.string().optional(),
+  text: z.string(),
+  tags: z.array(z.string()),
+  createdAt: z.string(),
+});
+export type MemoryEpisodeWire = z.infer<typeof memoryEpisodeSchema>;
+
+export const memoryEpisodesResultSchema = z.object({ episodes: z.array(memoryEpisodeSchema) });
+export type MemoryEpisodesResult = z.infer<typeof memoryEpisodesResultSchema>;
+
+export const memoryFactSchema = z.object({
+  id: z.string(),
+  text: z.string(),
+  tags: z.array(z.string()),
+  createdAt: z.string(),
+});
+export type MemoryFactWire = z.infer<typeof memoryFactSchema>;
+
+export const memoryFactsResultSchema = z.object({ facts: z.array(memoryFactSchema) });
+export type MemoryFactsResult = z.infer<typeof memoryFactsResultSchema>;
+
 /** Params validator per method, for dispatch. */
 export const methodParamsSchemas = {
   [METHODS.SESSION_CREATE]: sessionCreateParamsSchema,
@@ -255,6 +321,10 @@ export const methodParamsSchemas = {
   [METHODS.CRON_ADD]: cronAddParamsSchema,
   [METHODS.CRON_LIST]: z.object({}).strict(),
   [METHODS.CRON_REMOVE]: cronRemoveParamsSchema,
+  [METHODS.MEMORY_QUERY]: memoryQueryParamsSchema,
+  [METHODS.MEMORY_WRITE]: memoryWriteParamsSchema,
+  [METHODS.MEMORY_EPISODES]: z.object({}).strict(),
+  [METHODS.MEMORY_FACTS]: z.object({}).strict(),
 } as const;
 
 // --- approval.respond (client → daemon notification, no id, no response) ---
