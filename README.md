@@ -24,8 +24,13 @@ Committed so far:
 - **P1** — `crowd` daemon + `@crow/core` runtime (sessions, confined tools, skills)
 - **P2** — `@crow/client` + Electron desktop hub + tool-call approvals
 - **P3** — multihost fleet in the desktop app + `crow` CLI
+- **P4** — sub-agents (`agent.spawn`) and team presets (`team.run`)
+- **P5** — A2A daemon-to-daemon delegation (`agent.spawn { host }`, A2A HTTP)
+- **P6** — workflows (`workflow.run`) and cron scheduler (`cron.add`/`list`/`remove`)
+- **P7** — `@crow/memory`: SQLite + FTS5 episodes & facts, injected into sessions
+- **P8** — bundled skills, one-line installer, electron-builder packaging
 
-See `docs/` for the architecture and protocol spec. Next: P4 sub-agents/teams.
+See `docs/` for the architecture and protocol spec.
 
 ## Repository layout
 
@@ -112,6 +117,30 @@ crow prompt "hello" --url ws://127.0.0.1:7749 --token <token>
 
 If `crow` is not on your PATH, use `node apps/cli/src/bin.ts <args>` from the
 repo root (Node 22's type stripping runs the TS source directly).
+
+## One-line install
+
+```bash
+curl -sSf https://raw.githubusercontent.com/ferre-z/Crow-Agent/main/scripts/install.sh | sh
+```
+
+Auto-bootstraps Node 22.19+ (via nvm/fnm or the official tarball) and pnpm
+9 when missing, clones the repo, installs deps, builds the desktop, and
+symlinks `crowd` and `crow` into `~/.local/bin`. Set `CROW_INSTALL_PREFIX`,
+`CROW_INSTALL_DESKTOP=0`, etc. to customize.
+
+## Run a workflow / schedule one
+
+`crowd` ships with a built-in `self-check` workflow. Schedule it with cron:
+
+```bash
+crowd --skill-dir ./skills   # add the bundled skills to every session
+# from another terminal:
+crow prompt "summarize the repo" --host local
+# add a daily job:
+# (over the daemon's WS — use the desktop's workflows panel,
+#  or extend `crow cron` as a follow-up)
+```
 
 ## Tests
 

@@ -16,6 +16,7 @@ interface CliArgs {
   a2aPort?: number;
   a2aHost?: string;
   publicBaseUrl?: string;
+  skillDir: string[];
 }
 
 const USAGE = `crowd — the Crow per-host daemon
@@ -31,11 +32,12 @@ Options:
   --a2a-port N          also serve the A2A HTTP surface on this port (P5)
   --a2a-host ADDR       bind the A2A HTTP surface to this address (default: same as --host)
   --public-base-url URL advertise this A2A endpoint in host.info (e.g. when behind a proxy)
+  --skill-dir PATH      extra directory scanned for skills on every session (repeatable)
   --help                show this help
 `;
 
 function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = {};
+  const args: CliArgs = { skillDir: [] };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === undefined) break;
@@ -79,6 +81,9 @@ function parseArgs(argv: string[]): CliArgs {
       case "--public-base-url":
         args.publicBaseUrl = value();
         break;
+      case "--skill-dir":
+        args.skillDir.push(value());
+        break;
       case "--help":
       case "-h":
         process.stdout.write(USAGE);
@@ -111,6 +116,7 @@ async function main(): Promise<void> {
           },
         }
       : {}),
+    ...(args.skillDir.length > 0 ? { defaultSkillDirs: args.skillDir } : {}),
   });
   const { port } = await daemon.start();
   // Never log the token.

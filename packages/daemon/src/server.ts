@@ -111,6 +111,12 @@ export interface CrowDaemonOptions {
   a2a?: { host?: string; port?: number; publicBaseUrl?: string };
   /** P5: injected A2A client factory — only used by tests to swap the baseUrl. */
   createA2aClient?: (baseUrl: string, token: string) => CrowA2aClient;
+  /**
+   * P8: directories scanned for skills on session.create when the caller
+   * does not supply `skillDirs` explicitly. Ship the repo's `skills/`
+   * directory or copy it into `~/.crow/skills/`.
+   */
+  defaultSkillDirs?: string[];
 }
 
 interface ConnectionState {
@@ -153,8 +159,11 @@ export class CrowDaemon {
   private a2aServer: CrowA2aServer | undefined;
   private a2aBaseUrl: string | undefined;
 
+  private readonly defaultSkillDirs: string[];
+
   constructor(options: CrowDaemonOptions) {
     this.options = options;
+    this.defaultSkillDirs = options.defaultSkillDirs ?? [];
     const models = options.models ?? createCrowModels();
     const defaultModelRef = options.defaultModelRef ?? DEFAULT_MODEL_REF;
     this.manager = new CrowSessionManager({
@@ -504,7 +513,7 @@ export class CrowDaemon {
           cwd: p.cwd,
           modelRef: p.model,
           ...(composedSystemPrompt !== undefined ? { systemPrompt: composedSystemPrompt } : {}),
-          skillDirs: p.skillDirs,
+          skillDirs: p.skillDirs ?? this.defaultSkillDirs,
           approvalMode: p.approvalMode,
           autoApproveTools: p.autoApproveTools,
           approvalAsk: (req) => this.askForApproval(sessionId, req),

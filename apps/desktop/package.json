@@ -8,6 +8,7 @@
     "postinstall": "node node_modules/electron/install.js",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "package": "electron-vite build && electron-builder",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "test": "vitest run"
   },
@@ -24,8 +25,32 @@
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^5.2.0",
     "electron": "^43",
+    "electron-builder": "^25",
     "electron-vite": "^5",
     "tailwindcss": "^4",
     "vite": "^7"
+  },
+  "build": {
+    "appId": "ai.crow.desktop",
+    "productName": "Crow",
+    "directories": {
+      "buildResources": "build",
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "directories.output": "release",
+    "mac": {
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Development"
+    }
   }
 }
