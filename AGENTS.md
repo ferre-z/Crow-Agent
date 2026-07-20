@@ -1,57 +1,138 @@
 # Repository Guidelines
 
+This file is for AI coding agents working in this repository. It assumes no
+prior knowledge of the project.
+
+## Project Overview
+
+Crow is a multihost agent suite built on the
+[pi](https://github.com/earendil-works/pi) agent framework
+(`@earendil-works/pi-ai` + `@earendil-works/pi-agent-core`, consumed as plain
+npm dependencies — never fork or patch upstream; customize via
+extensions/skills/config only). It is a pnpm monorepo, TypeScript strict, ESM
+with NodeNext resolution everywhere.
+
+Crow ships three runtime pieces:
+
+- **`crowd`** (`packages/daemon`, `@crow/daemon`) — a daemon that runs on every
+  host you control. It embeds pi agent sessions (tools, skills, MCP) and
+  exposes a WebSocket JSON-RPC control API with bearer-token auth.
+- **Crow Desktop** (`apps/desktop`, `@crow/desktop`) — an Electron hub app
+  (electron-vite, React 19, Tailwind 4) that connects to many daemons at once:
+  chat, fleet view, tool-call approvals, per-host sessions.
+- **`crow`** (`apps/cli`, `@crow/cli`) — a thin CLI that talks to any daemon,
+  local or remote.
+
+Development is phase-planned (see `docs/architecture.md`): P0 scaffold → P1
+core+daemon → P2 desktop + `@crow/client` + approvals → P3 multihost fleet +
+CLI are committed. Next up: P4 sub-agents/teams, P5 A2A daemon-to-daemon, P6
+workflows+cron, P7 memory, P8 distribution. The README's `skills/` and
+`scripts/` directories are planned (P8) and do not exist yet.
+
 ## Project Structure & Module Organization
 
-Crow is a pnpm monorepo (TypeScript strict, ESM/NodeNext). Shared wire types
-live in `packages/protocol` (`@crow/protocol`); the agent runtime on the pi
-SDK lives in `packages/core` (`@crow/core`); custom memory in
-`packages/memory` (`@crow/memory`); the per-host daemon in `packages/daemon`
-(`@crow/daemon`, binary `crowd`); the typed daemon client in
-`packages/client` (`@crow/client`). Apps live under `apps/` (`desktop`
-Electron hub, `cli` thin client). Bundled skills live in `skills/`, design
-history and the protocol spec in `docs/`, utility scripts in `scripts/`.
+- `packages/protocol` (`@crow/protocol`) — single source of truth for the wire
+  format: zod schemas, JSON-RPC 2.0 framing, `event.*` notifications,
+  A2A types for later phases. Spec in `docs/protocol.md`.
+- `packages/core` (`@crow/core`) — agent runtime on the pi SDK: session
+  factory/manager (`session.ts`), default coding tools confined to a root
+  directory (`tools/`, `env/confined-env.ts`), skill loading (`skills.ts`),
+  model registry (`models.ts`), approval gate (`approvals.ts`), and the
+  scripted mock provider used by all tests (`testing/faux.ts`, re-exported as
+  `testing` from the package root).
+- `packages/memory` (`@crow/memory`) — custom SQLite memory (episodic log,
+  facts, FTS5). Currently a stub; filled in during P7.
+- `packages/daemon` (`@crow/daemon`, binary `crowd`) — per-host WS server,
+  token auth, session registry, config in `~/.crow/daemon.json`.
+- `packages/client` (`@crow/client`) — typed WS JSON-RPC client shared by the
+  desktop app and the CLI.
+- `apps/desktop` — Electron app; `src/main` (connection manager, hosts
+  store), `src/preload`, `src/renderer` (React UI), `src/shared`.
+- `apps/cli` — `crow` thin client; saved hosts live in `~/.crow/hosts.json`.
+- `docs/` — `architecture.md` (locked decisions, phase plan) and
+  `protocol.md` (wire spec). Keep these in sync with behavior changes.
 
 Unit tests are colocated as `*.test.ts` next to sources. Keep modules narrow;
-expose public APIs through each package's `src/index.ts`.
+expose public APIs through each package's `src/index.ts`. Workspace packages
+export their TypeScript sources directly (`exports` points at `src/index.ts`)
+— there is no compiled boundary between workspace packages, and Node 22's
+built-in type stripping runs sources directly in development (no build step
+needed to run the daemon or CLI from source).
 
 ## Build, Test, and Development Commands
 
-- `pnpm install` — install all workspace deps (Node ≥ 20, pnpm 9)
-- `pnpm check` — format:check + lint + typecheck + build + test (mirrors CI)
-- `pnpm test` / `pnpm typecheck` / `pnpm lint` / `pnpm build` — recursive across packages
+- `pnpm install` — install all workspace deps (pnpm 9; Node ≥ 22.19 required
+  by the pi packages, despite the looser `>=20` in the root engines field; CI
+  uses Node 22)
+- `pnpm check` — format:check + lint + typecheck + build + test (mirrors CI
+  exactly; run it before every commit)
+- `pnpm test` / `pnpm typecheck` / `pnpm lint` / `pnpm build` — recursive
+  across packages
 - `pnpm --filter @crow/<pkg> <script>` — run in one package
 - `pnpm format` — apply Prettier
+- Run the daemon: `pnpm --filter @crow/daemon start` (defaults: port 7749,
+  host 127.0.0.1, data dir `~/.crow`; a token is generated on first run into
+  `~/.crow/daemon.json`)
+- Run the desktop app: `pnpm --filter @crow/desktop dev`
+- Run the CLI from source: `node apps/cli/src/bin.ts <args>`
 
-Run `pnpm check` before committing. Tests use a scripted mock provider and
-require neither network access nor an API key.
+There is no deployment process yet — distribution (one-line installer) is P8
+and uncommitted. CI (`.github/workflows/ci.yml`) is a single job: install with
+`--frozen-lockfile`, then `pnpm check`, on pushes to `main` and all PRs.
 
 ## Coding Style & Naming Conventions
 
-Prettier (100 col, double quotes, semicolons) and ESLint flat config govern
-style; `verbatimModuleSyntax` is on, so use `import type` for type-only
-imports (enforced as inline type imports). Idiomatic TS naming: `camelCase`
-for functions/vars, `PascalCase` for types/classes, `SCREAMING_SNAKE_CASE`
-for constants. Prefer `zod` schemas at every process/network boundary.
+Prettier (100 col, double quotes, semicolons, trailing commas) and the ESLint
+flat config govern style. `verbatimModuleSyntax` is on, so use `import type`
+for type-only imports (ESLint enforces inline type imports via
+`consistent-type-imports`). Unused vars are an error unless prefixed with `_`.
+
+TS config highlights (`tsconfig.base.json`): strict, `noUncheckedIndexedAccess`,
+`noImplicitOverride`, `allowImportingTsExtensions`. Relative imports between
+source files use explicit `.ts` extensions.
+
+Idiomatic TS naming: `camelCase` for functions/vars, `PascalCase` for
+types/classes, `SCREAMING_SNAKE_CASE` for constants. Prefer `zod` schemas at
+every process/network boundary.
 
 ## Testing Guidelines
 
-Vitest everywhere. Name tests after observable behavior
-(`rejects_session_on_bad_token`). Keep tests deterministic — scripted mock
-LLM provider, fake timers for the scheduler, temp dirs for SQLite. No live
-API keys in tests.
+Vitest everywhere (no config files; each package runs `vitest run`). Tests are
+colocated `*.test.ts` files named after observable behavior
+(`rejects_session_on_bad_token`). Keep tests deterministic: script LLM
+responses with the faux provider from `@crow/core` (`testing.makeFauxModels()`,
+`testing.fauxAssistantMessage()`, `testing.fauxToolCall()`, …) — no live API
+keys, no network. Daemon/client/CLI tests spin up a real in-process `crowd`
+against the faux provider. Use temp dirs for any filesystem/SQLite state.
+
+## Wire Protocol Essentials
+
+Transport is WebSocket with newline-delimited JSON-RPC 2.0 frames. Auth is a
+bearer token in the `Authorization` header at WS upgrade time; a rejected
+upgrade answers HTTP 401 before any frames flow. Error codes: unknown method
+`-32601`, bad params `-32602`, unknown session `-32002`, prompt on busy
+session `-32003`, unparseable line `-32700`, invalid frame `-32600`. Tool-call
+approvals: in `approvalMode: "ask"` the daemon pauses tool calls and waits for
+an `approval.respond` notification from an attached client (120 s timeout,
+deny-by-default). Full spec: `docs/protocol.md`.
+
+## Security & Configuration
+
+Never commit API keys, tokens, session data, or SQLite state files. Daemon
+tokens live in `~/.crow/daemon.json` (mode 0600, auto-generated on first run,
+never logged; a corrupt config is a loud error, not a silent rotation). CLI
+hosts live in `~/.crow/hosts.json` (mode 0600). Preserve token auth on the WS
+API and path confinement in tools when changing daemon/core code: the
+`ConfinedExecutionEnv` in `packages/core/src/env/confined-env.ts` rejects any
+path resolving outside the session root (known gap: confinement is syntactic
+— symlinks inside the root can still escape; hardening is deferred).
 
 ## Commit & Pull Request Guidelines
 
 Conventional-Commit subjects (`feat(<scope>): …`, `fix(<scope>): …`,
 `chore: …`, `docs: …`, `test(<scope>): …`), ≤72 chars, body explains the why.
-Scopes: `protocol`, `core`, `memory`, `daemon`, `desktop`, `cli`, `repo`.
-One commit per logical unit. Do not push unless the owner asks.
-
-## Security & Configuration
-
-Never commit API keys, tokens, session data, or SQLite state files. Daemon
-tokens live in `~/.crow/daemon.json` (mode 0600). Preserve token auth on the
-WS API and path confinement in tools when changing daemon/core code.
+Scopes: `protocol`, `core`, `memory`, `daemon`, `client`, `desktop`, `cli`,
+`repo`. One commit per logical unit. Do not push unless the owner asks.
 
 ---
 
