@@ -58,6 +58,7 @@ export class ConnectionManager {
       host: c.host,
       state: c.state,
       info: c.info,
+      ...(c.error !== undefined ? { error: c.error } : {}),
     }));
   }
 
@@ -75,9 +76,12 @@ export class ConnectionManager {
     if (existing?.state === "connected") {
       return { ok: true, info: existing.info! };
     }
+    // Stale entry from a failed or dropped attempt — close its client and retry fresh.
+    if (existing) {
+      await existing.client.close().catch(() => undefined);
+    }
 
     const client = new CrowClient({ url: host.url, token: host.token });
-    this.setState(host.name, "disconnected"); // placeholder until connect()
     const conn: Connection = { host, client, state: "disconnected" };
     this.connections.set(host.name, conn);
 
@@ -87,12 +91,15 @@ export class ConnectionManager {
       await client.connect();
       const info = await client.hostInfo();
       conn.info = info;
+      conn.error = undefined;
       conn.state = "connected";
       this.options.onStateChange(host.name, "connected");
       return { ok: true, info };
     } catch (error) {
+      // Keep the entry: the fleet shows the host disconnected with its error,
+      // and a later connect() retries with a fresh client.
       conn.error = error instanceof Error ? error.message : String(error);
-      this.connections.delete(host.name);
+      conn.state = "disconnected";
       this.options.onStateChange(host.name, "disconnected");
       return classifyConnectError(error);
     }

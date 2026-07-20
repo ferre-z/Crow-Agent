@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ScreenProps } from "./App.tsx";
 import ApprovalModal from "./ApprovalModal.tsx";
 import ChatView from "./ChatView.tsx";
+import { connectHost } from "./connect-host.ts";
 import {
   makeSessionKey,
   selectActiveSession,
@@ -47,8 +48,14 @@ function SessionRow({
   );
 }
 
-export default function MainScreen({ state, dispatch }: ScreenProps) {
-  const connectedHosts = selectConnectedHosts(state).filter((h) => h.state === "connected");
+export default function MainScreen({
+  state,
+  dispatch,
+  onManageHosts,
+}: ScreenProps & { onManageHosts?: () => void }) {
+  const allHosts = selectConnectedHosts(state);
+  const connectedHosts = allHosts.filter((h) => h.state === "connected");
+  const disconnectedHosts = allHosts.filter((h) => h.state !== "connected");
   const sessions = selectSessions(state);
   const active = selectActiveSession(state);
   const currentApproval = selectCurrentApproval(state);
@@ -117,9 +124,39 @@ export default function MainScreen({ state, dispatch }: ScreenProps) {
         <div className="border-b border-line p-3">
           <div className="flex items-center justify-between">
             <span className="text-sm font-semibold text-crow">crow</span>
-            <span className="text-xs text-fg-dim">{connectedHosts.length} host(s) connected</span>
+            <button
+              onClick={onManageHosts}
+              className="rounded border border-line px-2 py-0.5 text-xs text-fg-dim hover:text-crow"
+            >
+              hosts ({connectedHosts.length}/{allHosts.length})
+            </button>
           </div>
         </div>
+
+        {disconnectedHosts.length > 0 ? (
+          <div className="border-b border-line p-2">
+            {disconnectedHosts.map((host) => (
+              <div key={host.host.name} className="mb-1 rounded border border-line px-2 py-1.5">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`h-2 w-2 shrink-0 rounded-full ${host.error ? "bg-danger" : "bg-fg-dim/40"}`}
+                  />
+                  <span className="min-w-0 flex-1 truncate text-xs">{host.host.name}</span>
+                  <button
+                    onClick={() => void connectHost(host.host, dispatch)}
+                    disabled={host.connecting === true}
+                    className="rounded bg-crow px-2 py-0.5 text-xs font-semibold text-ink hover:bg-crow-dim disabled:opacity-50"
+                  >
+                    {host.connecting ? "…" : "connect"}
+                  </button>
+                </div>
+                {host.error ? (
+                  <div className="mt-1 text-[11px] text-danger">{host.error}</div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
 
         <div className="border-b border-line p-3">
           <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-fg-dim">

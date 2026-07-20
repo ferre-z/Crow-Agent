@@ -20,7 +20,6 @@ const bridge: CrowBridge = {
   hostsRemove: (name) => ipcRenderer.invoke("hosts:remove", name),
   hostConnect: (host) => ipcRenderer.invoke("host:connect", host),
   hostDisconnect: (hostName) => ipcRenderer.invoke("host:disconnect", hostName),
-  hostReconnect: (hostName) => ipcRenderer.invoke("host:reconnect", hostName),
   fleetList: () => ipcRenderer.invoke("fleet:list"),
   sessionCreate: (params) => ipcRenderer.invoke("session:create", params),
   sessionSend: (params) => ipcRenderer.invoke("session:send", params),

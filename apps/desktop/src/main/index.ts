@@ -73,12 +73,6 @@ function registerIpc(): void {
 
   ipcMain.handle("host:disconnect", (_event, hostName: string) => manager.disconnect(hostName));
 
-  ipcMain.handle("host:reconnect", (_event, hostName: string) => {
-    const conn = manager.get(hostName);
-    if (!conn) throw new Error(`unknown host: ${hostName}`);
-    return manager.connect(conn.host);
-  });
-
   ipcMain.handle("fleet:list", () => manager.list());
 
   ipcMain.handle("session:create", async (_event, params: CreateSessionRequest) => {

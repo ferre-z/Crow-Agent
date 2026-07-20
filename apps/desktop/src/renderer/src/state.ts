@@ -146,6 +146,7 @@ export function reducer(state: AppState, action: Action): AppState {
           host: view.host,
           state: view.state,
           info: view.info,
+          ...(view.error !== undefined ? { error: view.error } : {}),
         };
       }
       return { ...state, fleet };
@@ -186,9 +187,14 @@ export function reducer(state: AppState, action: Action): AppState {
       });
 
     case "host.disconnect":
-      return dropHostSessions(setFleetHost(state, action.hostName, { state: "disconnected" }), [
-        action.hostName,
-      ]);
+      return dropHostSessions(
+        setFleetHost(state, action.hostName, {
+          state: "disconnected",
+          connecting: false,
+          error: undefined,
+        }),
+        [action.hostName],
+      );
 
     case "host.remove": {
       const fleet = { ...state.fleet };

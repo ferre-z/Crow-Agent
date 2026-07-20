@@ -52,6 +52,7 @@ export interface HostConnectionView {
   host: KnownHost;
   state: DaemonConnectionState;
   info?: HostInfoResult;
+  error?: string;
 }
 
 /** The contextBridge surface exposed to the renderer as `window.crow`. */
@@ -59,9 +60,9 @@ export interface CrowBridge {
   hostsList(): Promise<KnownHost[]>;
   hostsAdd(host: KnownHost): Promise<KnownHost[]>;
   hostsRemove(name: string): Promise<KnownHost[]>;
+  /** Connect (or reconnect) to a host. Idempotent: already-connected returns cached info. */
   hostConnect(host: KnownHost): Promise<ConnectResult>;
   hostDisconnect(hostName: string): Promise<void>;
-  hostReconnect(hostName: string): Promise<ConnectResult>;
   fleetList(): Promise<HostConnectionView[]>;
   sessionCreate(params: CreateSessionRequest): Promise<{ sessionId: string }>;
   sessionSend(params: SendPromptRequest): Promise<void>;
