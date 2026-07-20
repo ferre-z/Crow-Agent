@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -5,10 +7,13 @@ import path from "node:path";
 import {
   CrowSessionManager,
   createCrowModels,
+  CronScheduler,
   DEFAULT_MODEL_REF,
+  isWorkflow,
   SubAgentRunner,
   TEAM_PRESETS,
   TeamRunner,
+  WorkflowRunner,
   type ApprovalDecision,
   type ApprovalRequest,
   type ApprovalVerdict,
@@ -16,6 +21,7 @@ import {
   type CrowSessionEvent,
   type CrowSessionInfo,
   type Models,
+  type Workflow,
 } from "@crow/core";
 import { CrowA2aClient } from "./a2a-client.ts";
 import { CrowA2aServer } from "./a2a-server.ts";
@@ -34,6 +40,10 @@ import {
   RPC_ERRORS,
   type AgentSpawnParams,
   type ApprovalRespondParams,
+  type CronAddParams,
+  type CronJobWire,
+  type CronListResult,
+  type CronRemoveParams,
   type HostInfoResult,
   type JsonRpcFrame,
   type JsonRpcNotification,
@@ -46,6 +56,10 @@ import {
   type SessionSendParams,
   type TeamListResult,
   type TeamRunParams,
+  type WorkflowInfo,
+  type WorkflowListResult,
+  type WorkflowRunParams,
+  type WorkflowRunResult,
 } from "@crow/protocol";
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -117,6 +131,8 @@ export class CrowDaemon {
   private readonly manager: CrowSessionManager;
   private readonly subAgents: SubAgentRunner;
   private readonly teams: TeamRunner;
+  private readonly workflows: Map<string, Workflow>;
+  private readonly scheduler: CronScheduler;
   private readonly connections = new Set<ConnectionState>();
   private readonly sessionSubscriptions = new Map<string, () => void>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
@@ -139,6 +155,87 @@ export class CrowDaemon {
       defaultModelRef,
     });
     this.teams = new TeamRunner(this.subAgents, { delegate: this.delegateA2a.bind(this) });
+    this.workflows = new Map(loadBuiltinWorkflows(options.dataDir).map((w) => [w.name, w]));
+    this.scheduler = new CronScheduler(path.join(options.dataDir, "scheduler.db"));
+    this.scheduler.setFireCallback((job) => void this.fireCronJob(job));
+    this.scheduler.start();
+  }
+
+  private workflowsForRun(name: string): Workflow {
+    const workflow = this.workflows.get(name);
+    if (!workflow) throw new Error(`unknown workflow: ${name}`);
+    return workflow;
+  }
+
+  private buildWorkflowRunner(): WorkflowRunner {
+    return new WorkflowRunner({
+      prompt: async (params) => {
+        const { done } = await this.subAgents.spawn(params);
+        return await done;
+      },
+      shell: async (command, options) => this.runWorkflowShell(command, options),
+      a2a: this.delegateA2a.bind(this),
+    });
+  }
+
+  private async runWorkflowShell(
+    command: string,
+    options: { cwd: string; timeoutSeconds?: number },
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    const env = new NodeExecutionEnv({ cwd: options.cwd });
+    const result = await env.exec(command, {
+      ...(options.timeoutSeconds !== undefined ? { timeout: options.timeoutSeconds } : {}),
+    });
+    if (!result.ok) throw new Error(result.error.message);
+    return result.value;
+  }
+
+  private async fireCronJob(job: {
+    id: string;
+    name: string;
+    workflowName: string;
+    inputs: Record<string, unknown>;
+  }): Promise<void> {
+    let workflow: Workflow;
+    try {
+      workflow = this.workflowsForRun(job.workflowName);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.broadcastAll(
+        makeNotification(EVENTS.WORKFLOW, {
+          runId: "cron:" + job.id,
+          state: "error",
+          error: message,
+        }),
+      );
+      return;
+    }
+    const workflowRunId = `wrun_${job.id}_${Date.now()}`;
+    this.broadcastAll(
+      makeNotification(EVENTS.CRON_FIRED, {
+        jobId: job.id,
+        jobName: job.name,
+        workflowRunId,
+      }),
+    );
+    void this.executeWorkflow(workflow, workflowRunId, job.inputs).catch(() => {
+      // Errors already broadcast as event.workflow.
+    });
+  }
+
+  private async executeWorkflow(
+    workflow: Workflow,
+    runId: string,
+    inputs: Record<string, unknown>,
+  ): Promise<void> {
+    const runner = this.buildWorkflowRunner();
+    // Render the workflow steps against inputs (simple string substitution).
+    const prepared: Workflow = JSON.parse(JSON.stringify(workflow)) as Workflow;
+    renderWorkflowInputs(prepared, inputs);
+    await runner.run(prepared, (event) => {
+      const params: Record<string, unknown> = { runId, ...event };
+      this.broadcastAll(makeNotification(EVENTS.WORKFLOW, params));
+    });
   }
 
   /**
@@ -226,6 +323,7 @@ export class CrowDaemon {
     // reject as "aborted", and the resulting error events are no-ops because
     // the connections above are already closed (broadcastAll skips them).
     await this.subAgents.shutdown();
+    this.scheduler.close();
     if (this.a2aServer) {
       await this.a2aServer.stop();
       this.a2aServer = undefined;
@@ -369,13 +467,7 @@ export class CrowDaemon {
       this.sendFrame(conn, makeResult(id, result ?? {}));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const code = message.startsWith("unknown team:")
-        ? RPC_ERRORS.INVALID_PARAMS
-        : message.includes("not found")
-          ? RPC_ERRORS.SESSION_NOT_FOUND
-          : message.includes("busy")
-            ? RPC_ERRORS.SESSION_BUSY
-            : RPC_ERRORS.INTERNAL_ERROR;
+      const code = codeForMethodError(message);
       this.sendFrame(conn, makeError(id, code, message));
     }
   }
@@ -527,6 +619,48 @@ export class CrowDaemon {
         );
         return { runId };
       }
+      case METHODS.WORKFLOW_LIST: {
+        const result: WorkflowListResult = {
+          workflows: Array.from(this.workflows.values()).map(workflowInfo),
+        };
+        return result;
+      }
+      case METHODS.WORKFLOW_RUN: {
+        const p = params as WorkflowRunParams;
+        const workflow = this.workflowsForRun(p.workflow);
+        const runId = `wrun_${randomUUID()}`;
+        void this.executeWorkflow(workflow, runId, p.inputs ?? {}).catch(() => {
+          // Errors already broadcast as event.workflow.
+        });
+        const result: WorkflowRunResult = { runId };
+        return result;
+      }
+      case METHODS.CRON_ADD: {
+        const p = params as CronAddParams;
+        if (!this.workflows.has(p.workflow)) {
+          throw new Error(`unknown workflow: ${p.workflow}`);
+        }
+        const job = this.scheduler.add({
+          name: p.name,
+          workflowName: p.workflow,
+          recurrence: p.recurrence,
+          ...(p.inputs !== undefined ? { inputs: p.inputs } : {}),
+        });
+        return cronJobToWire(job);
+      }
+      case METHODS.CRON_LIST: {
+        const result: CronListResult = {
+          jobs: this.scheduler.list().map(cronJobToWire),
+        };
+        return result;
+      }
+      case METHODS.CRON_REMOVE: {
+        const p = params as CronRemoveParams;
+        if (!this.scheduler.remove(p.jobId)) {
+          throw new Error(`unknown cron job: ${p.jobId}`);
+        }
+        return {};
+      }
       default:
         // Unreachable: paramsValidators gates unknown methods first.
         throw new Error(`unhandled method: ${method}`);
@@ -618,4 +752,113 @@ function extractId(raw: unknown): RequestId {
     if (typeof id === "string" || typeof id === "number") return id;
   }
   return "unknown";
+}
+
+function codeForMethodError(message: string): number {
+  if (
+    message.startsWith("unknown team:") ||
+    message.startsWith("unknown workflow:") ||
+    message.startsWith("unknown cron job:")
+  ) {
+    return RPC_ERRORS.INVALID_PARAMS;
+  }
+  if (message.includes("not found")) return RPC_ERRORS.SESSION_NOT_FOUND;
+  if (message.includes("busy")) return RPC_ERRORS.SESSION_BUSY;
+  return RPC_ERRORS.INTERNAL_ERROR;
+}
+
+function cronJobToWire(job: {
+  id: string;
+  name: string;
+  workflowName: string;
+  recurrence: string;
+  inputs: Record<string, unknown>;
+  createdAt: string;
+  lastRunAt?: string;
+  nextRunAt: string;
+  enabled: boolean;
+}): CronJobWire {
+  return {
+    id: job.id,
+    name: job.name,
+    workflowName: job.workflowName,
+    recurrence: job.recurrence,
+    inputs: job.inputs,
+    createdAt: job.createdAt,
+    ...(job.lastRunAt ? { lastRunAt: job.lastRunAt } : {}),
+    nextRunAt: job.nextRunAt,
+    enabled: job.enabled,
+  };
+}
+
+function workflowInfo(workflow: Workflow): WorkflowInfo {
+  return {
+    name: workflow.name,
+    description: workflow.description,
+    cwd: workflow.cwd,
+    ...(workflow.allowShell ? { allowShell: true } : {}),
+    steps: workflow.steps.map((s) => ({ kind: s.kind, name: s.name })),
+  };
+}
+
+/** Replace `{{inputs.X}}` placeholders in any string fields of the workflow. */
+function renderWorkflowInputs(workflow: Workflow, inputs: Record<string, unknown>): void {
+  for (const step of workflow.steps) {
+    if (step.kind === "prompt" || step.kind === "a2a") {
+      step.prompt = substitute(step.prompt, inputs);
+      if (step.systemPrompt) step.systemPrompt = substitute(step.systemPrompt, inputs);
+    } else if (step.kind === "shell") {
+      step.command = substitute(step.command, inputs);
+    }
+  }
+}
+
+function substitute(text: string, inputs: Record<string, unknown>): string {
+  return text.replace(/\{\{inputs\.([a-zA-Z0-9_]+)\}\}/g, (_match, key: string) => {
+    const value = inputs[key];
+    return value === undefined || value === null ? "" : String(value);
+  });
+}
+
+/** Built-in workflows plus any user JSON files under `<dataDir>/workflows/`. */
+function loadBuiltinWorkflows(dataDir: string): Workflow[] {
+  const out: Workflow[] = [
+    {
+      name: "self-check",
+      description: "Spawn a sub-agent that summarizes the repo and shells out `ls -la` against it.",
+      cwd: process.cwd(),
+      allowShell: true,
+      steps: [
+        {
+          kind: "prompt",
+          name: "summarize",
+          prompt:
+            "List the files in the current directory and produce a one-sentence summary of the project.",
+        },
+        {
+          kind: "shell",
+          name: "list",
+          command: "ls -la",
+          timeoutSeconds: 30,
+        },
+      ],
+    },
+  ];
+  // User workflows loaded from <dataDir>/workflows/*.json (best-effort, never throw).
+  try {
+    const dir = path.join(dataDir, "workflows");
+    if (!fs.existsSync(dir)) return out;
+    for (const entry of fs.readdirSync(dir)) {
+      if (!entry.endsWith(".json")) continue;
+      try {
+        const raw = JSON.parse(fs.readFileSync(path.join(dir, entry), "utf8")) as unknown;
+        if (isWorkflow(raw)) out.push(raw);
+      } catch {
+        // Skip malformed files — the operator can fix them; the daemon never crashes.
+      }
+    }
+  } catch {
+    // Best effort.
+  }
+  return out;
 }

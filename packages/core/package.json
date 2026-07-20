@@ -16,6 +16,10 @@
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.80.10",
-    "@earendil-works/pi-ai": "^0.80.10"
+    "@earendil-works/pi-ai": "^0.80.10",
+    "better-sqlite3": "^12"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7"
   }
 }

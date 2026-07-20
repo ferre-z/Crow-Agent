@@ -863,4 +863,101 @@ describe("CrowDaemon", () => {
       expect(doneParams?.output).toBe("delegated answer");
     });
   });
+
+  describe("workflows & cron (P6)", () => {
+    it("lists the built-in workflows", async () => {
+      const client = await openClient();
+      const result = (await client.call(METHODS.WORKFLOW_LIST, {})) as {
+        workflows: { name: string; steps: { kind: string; name: string }[] }[];
+      };
+      const names = result.workflows.map((w) => w.name);
+      expect(names).toContain("self-check");
+    });
+
+    it("runs a workflow end-to-end (prompt + shell steps)", async () => {
+      faux.setResponses([testing.fauxAssistantMessage([testing.fauxText("summary")])]);
+      const client = await openClient();
+      const { runId } = (await client.call(METHODS.WORKFLOW_RUN, {
+        workflow: "self-check",
+        inputs: {},
+      })) as { runId: string };
+      await waitFor(
+        () =>
+          client.notifications.some(
+            (n) =>
+              n.method === EVENTS.WORKFLOW &&
+              (n.params as { runId?: string; state?: string }).runId === runId &&
+              (n.params as { state?: string }).state === "done",
+          ),
+        "workflow done",
+      );
+      const done = client.notifications
+        .map((n) => n.params)
+        .find(
+          (p) =>
+            (p as { runId?: string }).runId === runId && (p as { state?: string }).state === "done",
+        ) as { output: string } | undefined;
+      expect(done?.output).toBeTruthy();
+    });
+
+    it("rejects an unknown workflow with INVALID_PARAMS", async () => {
+      const client = await openClient();
+      await expect(client.call(METHODS.WORKFLOW_RUN, { workflow: "nope" })).rejects.toMatchObject({
+        code: RPC_ERRORS.INVALID_PARAMS,
+      });
+    });
+
+    it("adds, fires, and removes a cron job", async () => {
+      // Direct access to the scheduler; we don't have a public getter so we
+      // use the WS API plus a tick helper to drive the recurrence.
+      const client = await openClient();
+      faux.setResponses([testing.fauxAssistantMessage([testing.fauxText("tick")])]);
+      // Schedule a job whose nextRunAt is already in the past so it fires
+      // on the very next tick.
+      const addResult = (await client.call(METHODS.CRON_ADD, {
+        name: "every-tick",
+        workflow: "self-check",
+        recurrence: "@every 5m",
+        inputs: {},
+      })) as { id: string; workflowName: string };
+      const jobId = addResult.id;
+      expect(addResult.workflowName).toBe("self-check");
+
+      const listBefore = (await client.call(METHODS.CRON_LIST, {})) as {
+        jobs: { id: string }[];
+      };
+      expect(listBefore.jobs.find((j) => j.id === jobId)).toBeDefined();
+
+      // Backdate the nextRunAt so the next tick fires immediately, then tick.
+      const dao = daemon as unknown as {
+        scheduler: {
+          db: { prepare: (sql: string) => { run: (...a: unknown[]) => void } };
+          runOnce: () => Promise<{ id: string }[]>;
+        };
+      };
+      dao.scheduler.db
+        .prepare("UPDATE jobs SET nextRunAt = ? WHERE id = ?")
+        .run(new Date(Date.now() - 1000).toISOString(), jobId);
+      const fired = await dao.scheduler.runOnce();
+      expect(fired.find((j) => j.id === jobId)).toBeDefined();
+
+      const removed = (await client.call(METHODS.CRON_REMOVE, { jobId })) as object;
+      expect(removed).toEqual({});
+      const listAfter = (await client.call(METHODS.CRON_LIST, {})) as {
+        jobs: { id: string }[];
+      };
+      expect(listAfter.jobs.find((j) => j.id === jobId)).toBeUndefined();
+    });
+
+    it("rejects cron.add for an unknown workflow with INVALID_PARAMS", async () => {
+      const client = await openClient();
+      await expect(
+        client.call(METHODS.CRON_ADD, {
+          name: "bad",
+          workflow: "nope",
+          recurrence: "@every 5m",
+        }),
+      ).rejects.toMatchObject({ code: RPC_ERRORS.INVALID_PARAMS });
+    });
+  });
 });

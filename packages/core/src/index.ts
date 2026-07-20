@@ -63,6 +63,26 @@ export {
   type TeamRunEvent,
   type TeamRunEventListener,
 } from "./teams.ts";
+export {
+  CronScheduler,
+  parseRecurrence,
+  nextRunAt,
+  type CronJob,
+  type FireCallback,
+  type Recurrence,
+} from "./scheduler.ts";
+export {
+  WorkflowRunner,
+  isWorkflow,
+  type RunA2a,
+  type RunPrompt,
+  type RunShell,
+  type Workflow,
+  type WorkflowEvent,
+  type WorkflowEventListener,
+  type WorkflowRunnerOptions,
+  type WorkflowStep,
+} from "./workflows.ts";
 // Re-exported for @crow/daemon, which intentionally has no direct pi-ai dependency.
 export type { Models } from "@earendil-works/pi-ai";
 export * as testing from "./testing/faux.ts";

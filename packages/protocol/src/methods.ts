@@ -15,6 +15,11 @@ export const METHODS = {
   AGENT_SPAWN: "agent.spawn",
   TEAM_LIST: "team.list",
   TEAM_RUN: "team.run",
+  WORKFLOW_LIST: "workflow.list",
+  WORKFLOW_RUN: "workflow.run",
+  CRON_ADD: "cron.add",
+  CRON_LIST: "cron.list",
+  CRON_REMOVE: "cron.remove",
 } as const;
 
 /** Model reference as "provider/modelId" (e.g. "anthropic/claude-sonnet-4-5"). */
@@ -161,6 +166,79 @@ export const teamRunResultSchema = z.object({
 });
 export type TeamRunResult = z.infer<typeof teamRunResultSchema>;
 
+// --- workflow.list / workflow.run (P6) ---
+
+export const workflowInfoSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  cwd: z.string(),
+  allowShell: z.boolean().optional(),
+  steps: z.array(
+    z.object({
+      kind: z.enum(["prompt", "shell", "a2a"]),
+      name: z.string(),
+    }),
+  ),
+});
+export type WorkflowInfo = z.infer<typeof workflowInfoSchema>;
+
+export const workflowListResultSchema = z.object({
+  workflows: z.array(workflowInfoSchema),
+});
+export type WorkflowListResult = z.infer<typeof workflowListResultSchema>;
+
+export const workflowStepInputSchema = z
+  .object({
+    name: z.string(),
+    value: z.unknown(),
+  })
+  .passthrough();
+
+export const workflowRunParamsSchema = z.object({
+  workflow: z.string().min(1),
+  inputs: z.record(z.unknown()).optional(),
+});
+export type WorkflowRunParams = z.infer<typeof workflowRunParamsSchema>;
+
+export const workflowRunResultSchema = z.object({
+  runId: z.string(),
+});
+export type WorkflowRunResult = z.infer<typeof workflowRunResultSchema>;
+
+// --- cron.add / cron.list / cron.remove (P6) ---
+
+export const cronAddParamsSchema = z.object({
+  name: z.string().min(1),
+  workflow: z.string().min(1),
+  recurrence: z.string().min(1),
+  inputs: z.record(z.unknown()).optional(),
+});
+export type CronAddParams = z.infer<typeof cronAddParamsSchema>;
+
+export const cronJobSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  workflowName: z.string(),
+  recurrence: z.string(),
+  inputs: z.record(z.unknown()),
+  createdAt: z.string(),
+  lastRunAt: z.string().optional(),
+  nextRunAt: z.string(),
+  enabled: z.boolean(),
+});
+export type CronJobWire = z.infer<typeof cronJobSchema>;
+
+export const cronAddResultSchema = cronJobSchema;
+export type CronAddResult = CronJobWire;
+
+export const cronListResultSchema = z.object({ jobs: z.array(cronJobSchema) });
+export type CronListResult = z.infer<typeof cronListResultSchema>;
+
+export const cronRemoveParamsSchema = z.object({
+  jobId: z.string().min(1),
+});
+export type CronRemoveParams = z.infer<typeof cronRemoveParamsSchema>;
+
 /** Params validator per method, for dispatch. */
 export const methodParamsSchemas = {
   [METHODS.SESSION_CREATE]: sessionCreateParamsSchema,
@@ -172,6 +250,11 @@ export const methodParamsSchemas = {
   [METHODS.AGENT_SPAWN]: agentSpawnParamsSchema,
   [METHODS.TEAM_LIST]: z.object({}).strict(),
   [METHODS.TEAM_RUN]: teamRunParamsSchema,
+  [METHODS.WORKFLOW_LIST]: z.object({}).strict(),
+  [METHODS.WORKFLOW_RUN]: workflowRunParamsSchema,
+  [METHODS.CRON_ADD]: cronAddParamsSchema,
+  [METHODS.CRON_LIST]: z.object({}).strict(),
+  [METHODS.CRON_REMOVE]: cronRemoveParamsSchema,
 } as const;
 
 // --- approval.respond (client → daemon notification, no id, no response) ---

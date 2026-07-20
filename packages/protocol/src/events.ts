@@ -13,6 +13,8 @@ export const EVENTS = {
   APPROVAL_REQUEST: "event.approval_request",
   AGENT: "event.agent",
   TEAM: "event.team",
+  WORKFLOW: "event.workflow",
+  CRON_FIRED: "event.cron_fired",
 } as const;
 
 export const sessionStateSchema = z.enum(["idle", "streaming", "error"]);
@@ -95,6 +97,29 @@ export const teamEventSchema = z.object({
 });
 export type TeamEvent = z.infer<typeof teamEventSchema>;
 
+/**
+ * Workflow run progress (P6). `step` is 1-based; "done" carries the final
+ * `output`; "error" carries `step`/`name`/`error`.
+ */
+export const workflowEventSchema = z.object({
+  runId: z.string(),
+  state: z.enum(["step_started", "step_done", "done", "error"]),
+  step: z.number().int().min(1).optional(),
+  name: z.string().optional(),
+  kind: z.enum(["prompt", "shell", "a2a"]).optional(),
+  output: z.string().optional(),
+  error: z.string().optional(),
+});
+export type WorkflowEvent = z.infer<typeof workflowEventSchema>;
+
+/** A cron job fired (P6). Lets clients attribute a workflow run to a job. */
+export const cronFiredEventSchema = z.object({
+  jobId: z.string(),
+  jobName: z.string(),
+  workflowRunId: z.string(),
+});
+export type CronFiredEvent = z.infer<typeof cronFiredEventSchema>;
+
 /** Params validator per event method. */
 export const eventParamsSchemas = {
   [EVENTS.TOKEN]: tokenEventSchema,
@@ -105,4 +130,6 @@ export const eventParamsSchemas = {
   [EVENTS.APPROVAL_REQUEST]: approvalRequestEventSchema,
   [EVENTS.AGENT]: agentEventSchema,
   [EVENTS.TEAM]: teamEventSchema,
+  [EVENTS.WORKFLOW]: workflowEventSchema,
+  [EVENTS.CRON_FIRED]: cronFiredEventSchema,
 } as const;

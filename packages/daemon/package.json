@@ -21,6 +21,7 @@
   "dependencies": {
     "@crow/core": "workspace:^",
     "@crow/protocol": "workspace:^",
+    "@earendil-works/pi-agent-core": "^0.80.10",
     "ws": "^8"
   },
   "devDependencies": {
