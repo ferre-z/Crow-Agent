@@ -691,4 +691,176 @@ describe("CrowDaemon", () => {
       expect(teamEvents(client)).toHaveLength(0);
     });
   });
+
+  describe("A2A HTTP surface", () => {
+    let a2aDaemon: CrowDaemon;
+    let a2aTmp: string;
+    let a2aWsPort: number;
+    let a2aBaseUrl: string;
+
+    beforeEach(async () => {
+      a2aTmp = await mkdtemp(path.join(os.tmpdir(), "crow-a2a-"));
+      const { models: m, faux: f } = testing.makeFauxModels();
+      faux = f;
+      a2aDaemon = new CrowDaemon({
+        host: "127.0.0.1",
+        port: 0,
+        token: "a2a-token",
+        dataDir: a2aTmp,
+        models: m,
+        defaultModelRef: "faux/faux-1",
+        a2a: { port: 0 },
+      });
+      const info = await a2aDaemon.start();
+      a2aWsPort = info.port;
+      const ws = await connect(a2aWsPort, "a2a-token");
+      const probe = makeClient(ws);
+      try {
+        const hostInfo = (await probe.call(METHODS.HOST_INFO, {})) as { a2a?: string };
+        a2aBaseUrl = hostInfo.a2a ?? "";
+      } finally {
+        await probe.close();
+      }
+      expect(a2aBaseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    });
+
+    afterEach(async () => {
+      await a2aDaemon.stop();
+      await rm(a2aTmp, { recursive: true, force: true });
+    });
+
+    it("serves /.well-known/agent.json on the A2A port", async () => {
+      const res = await fetch(`${a2aBaseUrl}/.well-known/agent.json`, {
+        headers: { authorization: "Bearer a2a-token" },
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { name: string; endpoint: string };
+      expect(body.name).toBe("crow");
+      expect(body.endpoint).toBe(`${a2aBaseUrl}/a2a/tasks`);
+    });
+
+    it("rejects A2A requests without a valid token", async () => {
+      const res = await fetch(`${a2aBaseUrl}/.well-known/agent.json`);
+      expect(res.status).toBe(401);
+    });
+
+    it("runs a delegated task end-to-end (POST → poll → done)", async () => {
+      faux.setResponses([testing.fauxAssistantMessage([testing.fauxText("remote output")])]);
+      const post = await fetch(`${a2aBaseUrl}/a2a/tasks`, {
+        method: "POST",
+        headers: { authorization: "Bearer a2a-token", "content-type": "application/json" },
+        body: JSON.stringify({ prompt: "hi", cwd: workdir }),
+      });
+      expect(post.status).toBe(201);
+      const { taskId } = (await post.json()) as { taskId: string };
+      let final: { state: string; output?: string; error?: string } | undefined;
+      await vi.waitFor(
+        async () => {
+          const r = await fetch(`${a2aBaseUrl}/a2a/tasks/${taskId}`, {
+            headers: { authorization: "Bearer a2a-token" },
+          });
+          final = (await r.json()) as typeof final;
+          if (final?.state === "running") throw new Error("still running");
+        },
+        { timeout: 5000, interval: 25 },
+      );
+      expect(final?.state).toBe("done");
+      expect(final?.output).toBe("remote output");
+    });
+
+    it("returns the A2A base URL in host.info over WS", async () => {
+      const client = makeClient(await connect(a2aWsPort, "a2a-token"));
+      try {
+        const info = (await client.call(METHODS.HOST_INFO, {})) as { a2a?: string };
+        expect(info.a2a).toBe(a2aBaseUrl);
+      } finally {
+        await client.close();
+      }
+    });
+  });
+
+  describe("A2A delegation via WS agent.spawn", () => {
+    let remote: CrowDaemon;
+    let local: CrowDaemon;
+    let localPort: number;
+    let remoteBaseUrl: string;
+    let tmpA: string;
+    let tmpB: string;
+
+    beforeEach(async () => {
+      tmpA = await mkdtemp(path.join(os.tmpdir(), "crow-a2a-local-"));
+      tmpB = await mkdtemp(path.join(os.tmpdir(), "crow-a2a-remote-"));
+      const { models: localModels, faux: _local } = testing.makeFauxModels();
+      const { models: remoteModels, faux: remoteFaux } = testing.makeFauxModels();
+      faux = remoteFaux;
+      local = new CrowDaemon({
+        host: "127.0.0.1",
+        port: 0,
+        token: "shared-token",
+        dataDir: tmpA,
+        models: localModels,
+        defaultModelRef: "faux/faux-1",
+      });
+      localPort = (await local.start()).port;
+      remote = new CrowDaemon({
+        host: "127.0.0.1",
+        port: 0,
+        token: "shared-token",
+        dataDir: tmpB,
+        models: remoteModels,
+        defaultModelRef: "faux/faux-1",
+        a2a: { port: 0 },
+      });
+      const info = await remote.start();
+      const remoteWsPort = info.port;
+      const ws = await connect(remoteWsPort, "shared-token");
+      const probe = makeClient(ws);
+      try {
+        const hostInfo = (await probe.call(METHODS.HOST_INFO, {})) as { a2a?: string };
+        remoteBaseUrl = hostInfo.a2a ?? "";
+      } finally {
+        await probe.close();
+      }
+      expect(remoteBaseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    });
+
+    afterEach(async () => {
+      await local.stop();
+      await remote.stop();
+      await rm(tmpA, { recursive: true, force: true });
+      await rm(tmpB, { recursive: true, force: true });
+    });
+
+    it("delegates agent.spawn to a remote A2A endpoint and streams done events locally", async () => {
+      faux.setResponses([testing.fauxAssistantMessage([testing.fauxText("delegated answer")])]);
+      const client = makeClient(await connect(localPort, "shared-token"));
+      clients.push(client);
+
+      const { agentId } = (await client.call(METHODS.AGENT_SPAWN, {
+        prompt: "do it",
+        cwd: workdir,
+        host: remoteBaseUrl,
+      })) as { agentId: string };
+      expect(agentId).toMatch(/^agent_/);
+
+      await waitFor(
+        () =>
+          client.notifications.some(
+            (n) =>
+              n.method === EVENTS.AGENT &&
+              (n.params as { agentId?: string; state?: string }).agentId === agentId &&
+              (n.params as { state?: string }).state === "done",
+          ),
+        "delegation done event",
+      );
+      const doneParams = client.notifications
+        .map((n) => n.params)
+        .find(
+          (p) =>
+            (p as { agentId?: string }).agentId === agentId &&
+            (p as { state?: string }).state === "done",
+        ) as { output: string } | undefined;
+      expect(doneParams?.output).toBe("delegated answer");
+    });
+  });
 });

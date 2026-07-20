@@ -17,6 +17,8 @@ import {
   type CrowSessionInfo,
   type Models,
 } from "@crow/core";
+import { CrowA2aClient } from "./a2a-client.ts";
+import { CrowA2aServer } from "./a2a-server.ts";
 import {
   approvalRespondParamsSchema,
   encodeFrame,
@@ -75,6 +77,14 @@ export interface CrowDaemonOptions {
   defaultModelRef?: string;
   /** How long a tool call waits for approval.respond; defaults to 120 s. */
   approvalTimeoutMs?: number;
+  /**
+   * P5: when set, the daemon also serves an A2A HTTP surface on this port
+   * and accepts agent.spawn delegations from other daemons via the
+   * `host` param (and team presets with per-step `host`).
+   */
+  a2a?: { host?: string; port?: number; publicBaseUrl?: string };
+  /** P5: injected A2A client factory — only used by tests to swap the baseUrl. */
+  createA2aClient?: (baseUrl: string, token: string) => CrowA2aClient;
 }
 
 interface ConnectionState {
@@ -111,6 +121,8 @@ export class CrowDaemon {
   private readonly sessionSubscriptions = new Map<string, () => void>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private wss: WebSocketServer | undefined;
+  private a2aServer: CrowA2aServer | undefined;
+  private a2aBaseUrl: string | undefined;
 
   constructor(options: CrowDaemonOptions) {
     this.options = options;
@@ -126,7 +138,26 @@ export class CrowDaemon {
       models,
       defaultModelRef,
     });
-    this.teams = new TeamRunner(this.subAgents);
+    this.teams = new TeamRunner(this.subAgents, { delegate: this.delegateA2a.bind(this) });
+  }
+
+  /**
+   * Hook used by TeamRunner when a preset step declares `host`. Default
+   * implementation instantiates a CrowA2aClient; tests inject their own.
+   */
+  private async delegateA2a(
+    baseUrl: string,
+    params: {
+      prompt: string;
+      cwd: string;
+      systemPrompt?: string;
+      tools?: string[];
+      model?: string;
+    },
+  ): Promise<{ output: string }> {
+    const factory =
+      this.options.createA2aClient ?? ((url, token) => new CrowA2aClient({ baseUrl: url, token }));
+    return factory(baseUrl, this.options.token).delegate(params);
   }
 
   start(): Promise<{ port: number }> {
@@ -141,12 +172,34 @@ export class CrowDaemon {
         },
       });
       wss.on("error", reject);
-      wss.on("listening", () => {
+      wss.on("listening", async () => {
         this.wss = wss;
         const address = wss.address();
-        resolve({
-          port: typeof address === "object" && address !== null ? address.port : this.options.port,
-        });
+        const wsPort =
+          typeof address === "object" && address !== null ? address.port : this.options.port;
+        if (this.options.a2a) {
+          const a2aPort = this.options.a2a.port ?? wsPort + 1;
+          const a2aHost = this.options.a2a.host ?? this.options.host;
+          const server = new CrowA2aServer({
+            host: a2aHost,
+            port: a2aPort,
+            token: this.options.token,
+            models: this.options.models ?? createCrowModels(),
+            subAgents: this.subAgents,
+            ...(this.options.a2a.publicBaseUrl
+              ? { publicBaseUrl: this.options.a2a.publicBaseUrl }
+              : {}),
+          });
+          try {
+            await server.start();
+            this.a2aServer = server;
+            this.a2aBaseUrl = server.baseUrl();
+          } catch (error) {
+            reject(error);
+            return;
+          }
+        }
+        resolve({ port: wsPort });
       });
       wss.on("connection", (ws) => this.onConnection(ws));
     });
@@ -173,6 +226,10 @@ export class CrowDaemon {
     // reject as "aborted", and the resulting error events are no-ops because
     // the connections above are already closed (broadcastAll skips them).
     await this.subAgents.shutdown();
+    if (this.a2aServer) {
+      await this.a2aServer.stop();
+      this.a2aServer = undefined;
+    }
     await new Promise<void>((resolve) => {
       if (!this.wss) {
         resolve();
@@ -384,12 +441,38 @@ export class CrowDaemon {
           daemonVersion: DAEMON_VERSION,
           protocolVersion: PROTOCOL_VERSION,
           sessions: this.manager.list().length,
+          ...(this.a2aBaseUrl ? { a2a: this.a2aBaseUrl } : {}),
         };
         return result;
       }
       case METHODS.AGENT_SPAWN: {
         const p = params as AgentSpawnParams;
-        const { agentId, done } = await this.subAgents.spawn({
+        const agentId = `agent_${randomUUID()}`;
+        this.broadcastAll(makeNotification(EVENTS.AGENT, { agentId, state: "started" }));
+        if (p.host) {
+          // P5 cross-daemon delegation: the local daemon delegates to the
+          // remote A2A endpoint and surfaces the result as its own events.
+          void this.delegateA2a(p.host, {
+            prompt: p.prompt,
+            cwd: p.cwd,
+            ...(p.systemPrompt !== undefined ? { systemPrompt: p.systemPrompt } : {}),
+            ...(p.tools !== undefined ? { tools: p.tools } : {}),
+            ...(p.model !== undefined ? { model: p.model } : {}),
+          }).then(
+            ({ output }) =>
+              this.broadcastAll(makeNotification(EVENTS.AGENT, { agentId, state: "done", output })),
+            (error: unknown) =>
+              this.broadcastAll(
+                makeNotification(EVENTS.AGENT, {
+                  agentId,
+                  state: "error",
+                  error: error instanceof Error ? error.message : String(error),
+                }),
+              ),
+          );
+          return { agentId };
+        }
+        const { done } = await this.subAgents.spawn({
           prompt: p.prompt,
           cwd: p.cwd,
           ...(p.systemPrompt !== undefined ? { systemPrompt: p.systemPrompt } : {}),
@@ -397,7 +480,6 @@ export class CrowDaemon {
           ...(p.model !== undefined ? { model: p.model } : {}),
         });
         // Sub-agent events go to every connected client, not just the spawner.
-        this.broadcastAll(makeNotification(EVENTS.AGENT, { agentId, state: "started" }));
         done.then(
           ({ output }) =>
             this.broadcastAll(makeNotification(EVENTS.AGENT, { agentId, state: "done", output })),

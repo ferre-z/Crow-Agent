@@ -7,7 +7,29 @@ export interface TeamAgentSpec {
   /** Whitelist of default coding tool names; absent = full set. */
   tools?: string[];
   model?: string;
+  /**
+   * P5: when set, this step is delegated to the given A2A base URL instead
+   * of running locally. The runner invokes its `delegate` hook.
+   */
+  host?: string;
 }
+
+/**
+ * Hook for cross-host step delegation (P5). When the runner sees a step
+ * with `host` set, it calls this instead of spawning a local sub-agent.
+ * `baseUrl` is the A2A endpoint; the hook POSTs the task, waits for
+ * completion, and returns the final output text.
+ */
+export type TeamStepDelegate = (
+  baseUrl: string,
+  params: {
+    prompt: string;
+    cwd: string;
+    systemPrompt?: string;
+    tools?: string[];
+    model?: string;
+  },
+) => Promise<{ output: string }>;
 
 export interface TeamPreset {
   name: string;
@@ -88,9 +110,11 @@ export interface RunTeamOptions {
  */
 export class TeamRunner {
   private readonly subAgents: SubAgentRunner;
+  private readonly delegate?: TeamStepDelegate;
 
-  constructor(subAgents: SubAgentRunner) {
+  constructor(subAgents: SubAgentRunner, options: { delegate?: TeamStepDelegate } = {}) {
     this.subAgents = subAgents;
+    this.delegate = options.delegate;
   }
 
   getPreset(name: string): TeamPreset | undefined {
@@ -119,14 +143,25 @@ export class TeamRunner {
       }
       try {
         const model = agent.model ?? options.model;
-        const { done } = await this.subAgents.spawn({
+        const stepBaseParams = {
           prompt,
           cwd: options.cwd,
           ...(agent.systemPrompt !== undefined ? { systemPrompt: agent.systemPrompt } : {}),
           ...(agent.tools !== undefined ? { tools: agent.tools } : {}),
           ...(model !== undefined ? { model } : {}),
-        });
-        const { output } = await done;
+        };
+        let output: string;
+        if (agent.host) {
+          if (!this.delegate) {
+            throw new Error(
+              `step '${agent.name}' requires A2A delegation but no delegate is configured`,
+            );
+          }
+          ({ output } = await this.delegate(agent.host, stepBaseParams));
+        } else {
+          const { done } = await this.subAgents.spawn(stepBaseParams);
+          ({ output } = await done);
+        }
         previous.push({ name: agent.name, output });
         onEvent({ state: "step_done", step, agent: agent.name, output });
       } catch (error) {

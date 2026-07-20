@@ -94,6 +94,8 @@ export const hostInfoResultSchema = z.object({
   daemonVersion: z.string(),
   protocolVersion: z.string(),
   sessions: z.number(),
+  /** P5: A2A base URL when the daemon's HTTP A2A surface is enabled. */
+  a2a: z.string().optional(),
 });
 export type HostInfoResult = z.infer<typeof hostInfoResultSchema>;
 
@@ -111,6 +113,8 @@ export const agentSpawnParamsSchema = z.object({
   systemPrompt: z.string().optional(),
   tools: z.array(z.string()).optional(),
   model: modelRefSchema.optional(),
+  /** P5: when set, the daemon delegates to this A2A base URL instead of running locally. */
+  host: z.string().url().optional(),
 });
 export type AgentSpawnParams = z.infer<typeof agentSpawnParamsSchema>;
 

@@ -13,6 +13,9 @@ interface CliArgs {
   dataDir?: string;
   model?: string;
   token?: string;
+  a2aPort?: number;
+  a2aHost?: string;
+  publicBaseUrl?: string;
 }
 
 const USAGE = `crowd — the Crow per-host daemon
@@ -20,12 +23,15 @@ const USAGE = `crowd — the Crow per-host daemon
 Usage: crowd [options]
 
 Options:
-  --port N         listen port (default: from daemon.json, initially 7749)
-  --host ADDR      listen address (default: from daemon.json, initially 127.0.0.1)
-  --data-dir PATH  state directory (default: ~/.crow)
-  --model REF      default model ref "provider/modelId" (default: ${DEFAULT_MODEL_REF})
-  --token TOKEN    override the auth token from daemon.json (dev/test use)
-  --help           show this help
+  --port N              listen port (default: from daemon.json, initially 7749)
+  --host ADDR           listen address (default: from daemon.json, initially 127.0.0.1)
+  --data-dir PATH       state directory (default: ~/.crow)
+  --model REF           default model ref "provider/modelId" (default: ${DEFAULT_MODEL_REF})
+  --token TOKEN         override the auth token from daemon.json (dev/test use)
+  --a2a-port N          also serve the A2A HTTP surface on this port (P5)
+  --a2a-host ADDR       bind the A2A HTTP surface to this address (default: same as --host)
+  --public-base-url URL advertise this A2A endpoint in host.info (e.g. when behind a proxy)
+  --help                show this help
 `;
 
 function parseArgs(argv: string[]): CliArgs {
@@ -59,6 +65,20 @@ function parseArgs(argv: string[]): CliArgs {
       case "--token":
         args.token = value();
         break;
+      case "--a2a-port": {
+        const n = Number(value());
+        if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+          throw new Error(`invalid --a2a-port: must be an integer in 1..65535`);
+        }
+        args.a2aPort = n;
+        break;
+      }
+      case "--a2a-host":
+        args.a2aHost = value();
+        break;
+      case "--public-base-url":
+        args.publicBaseUrl = value();
+        break;
       case "--help":
       case "-h":
         process.stdout.write(USAGE);
@@ -82,6 +102,15 @@ async function main(): Promise<void> {
     token: args.token ?? config.token,
     dataDir,
     defaultModelRef: args.model ?? DEFAULT_MODEL_REF,
+    ...(args.a2aPort !== undefined || args.a2aHost !== undefined || args.publicBaseUrl
+      ? {
+          a2a: {
+            ...(args.a2aPort !== undefined ? { port: args.a2aPort } : {}),
+            ...(args.a2aHost !== undefined ? { host: args.a2aHost } : {}),
+            ...(args.publicBaseUrl !== undefined ? { publicBaseUrl: args.publicBaseUrl } : {}),
+          },
+        }
+      : {}),
   });
   const { port } = await daemon.start();
   // Never log the token.
